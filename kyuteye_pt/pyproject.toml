@@ -26,12 +26,17 @@ dependencies = [
     "tqdm",
     "transformers==4.47.0",
     "triton",
-    "fire", 
+    "fire",
     "rich",
     "pyyaml",
     "black",
     "setuptools",
     "sphn >= 0.1.4",
+]
+
+[project.optional-dependencies]
+omni = [
+    "openai >= 1.0",  # default LLM-based retriever in kyuteye.omni
 ]
 
 [project.scripts]

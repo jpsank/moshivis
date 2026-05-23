@@ -6,6 +6,7 @@
 """Start Pytorch backend"""
 
 import asyncio
+import importlib
 import os
 import random
 import time
@@ -25,6 +26,13 @@ from kyuteye.config.enums import ImageEncoder
 from kyuteye.config.kyuteye_config import KyuteyeConfig
 from kyuteye.models.loaders import get_moshi_vis
 from kyuteye.modules.image_transforms import get_minimal_transforms
+from kyuteye.omni import (
+    ContextInjector,
+    OmniRAGManager,
+    TextStreamMonitor,
+    default_registry,
+    get_retriever,
+)
 from moshi.models.loaders import get_mimi
 from torchvision.io import ImageReadMode, decode_image
 
@@ -96,6 +104,14 @@ class ServerState:
         max_msg_size: int = 0,
         image_size: int = 448,
         xa_start: int = 0,
+        omni_enabled: bool = False,
+        omni_rag_trigger: str = "<ret>",
+        omni_rag_timeout: float = 1.5,
+        omni_rag_max_tokens: int = 512,
+        omni_rag_wait_steps: int = 0,
+        omni_xa_injection: bool = True,
+        omni_tool_start: str = "[TOOL:",
+        omni_tool_end: str = "]",
     ):
         self.mimi = mimi
         self.text_tokenizer = text_tokenizer
@@ -110,6 +126,15 @@ class ServerState:
         self.dtype = dtype
         self.frame_size = int(self.mimi.sample_rate / self.mimi.frame_rate)
         self.lock = asyncio.Lock()
+
+        self.omni_enabled = omni_enabled
+        self.omni_rag_trigger = omni_rag_trigger
+        self.omni_rag_timeout = omni_rag_timeout
+        self.omni_rag_max_tokens = omni_rag_max_tokens
+        self.omni_rag_wait_steps = omni_rag_wait_steps
+        self.omni_xa_injection = omni_xa_injection
+        self.omni_tool_start = omni_tool_start
+        self.omni_tool_end = omni_tool_end
 
         self.mimi.streaming_forever(1)
         self.moshi_vis.streaming_forever(1)
@@ -138,6 +163,61 @@ class ServerState:
         ws = web.WebSocketResponse(max_msg_size=self.max_msg_size)
         await ws.prepare(request)
         close = False
+
+        # Per-channel Omni state. Each WebSocket gets its own monitor / RAG
+        # manager / context injector so transcripts and retrieval history do
+        # not bleed between simultaneous conversations.
+        monitor = TextStreamMonitor(
+            rag_trigger=self.omni_rag_trigger,
+            tool_start=self.omni_tool_start,
+            tool_end=self.omni_tool_end,
+        )
+        context_injector = ContextInjector(
+            moshi_vis=self.moshi_vis,
+            tokenizer=self.text_tokenizer,
+            device=self.device,
+            dtype=self.dtype,
+            enabled=self.omni_enabled and self.omni_xa_injection,
+        )
+        retriever = get_retriever() if self.omni_enabled else None
+        rag_manager: OmniRAGManager | None = None
+        if retriever is not None:
+            rag_manager = OmniRAGManager(
+                retriever,
+                rag_timeout=self.omni_rag_timeout,
+                max_tokens=self.omni_rag_max_tokens,
+            )
+
+        async def send_omni_text(payload: str, marker: int = 0) -> None:
+            """Send a system / retrieved-text annotation to the client.
+
+            Reuses the existing ``\\x07`` text frame so the web UI does not
+            need a new opcode -- we just colorize it differently (marker
+            byte controls the gating color in the JS client).
+            """
+            msg = b"\x07" + marker.to_bytes(1, "big") + payload.encode("utf-8")
+            await ws.send_bytes(msg)
+
+        async def on_reference_text(reference: str) -> None:
+            if reference:
+                log("info", f"[Omni] retrieved reference: {reference[:120]!r}")
+                await send_omni_text(f" [REF: {reference}] ", marker=10)
+                context_injector.add_text(reference, role="reference")
+            else:
+                await send_omni_text(" [RET_FAILED] ", marker=10)
+
+        async def dispatch_tool(event: Any) -> None:
+            if event.tool is None:
+                await send_omni_text(
+                    f" [TOOL_ERROR: failed to parse {event.raw!r}] ", marker=10
+                )
+                return
+            log("info", f"[Omni] dispatching tool {event.tool.name}({event.tool.args}, {event.tool.kwargs})")
+            result = await default_registry.dispatch(event.tool)
+            await send_omni_text(f" [TOOL:{event.tool.name} -> {result}] ", marker=10)
+            context_injector.add_text(
+                f"{event.tool.name} -> {result}", role="tool"
+            )
 
         async def recv_loop() -> None:
             nonlocal close
@@ -195,15 +275,21 @@ class ServerState:
                     chunk = chunk.to(device=self.device)[None, None]
                     codes = self.mimi.encode(chunk)
                     for c in range(codes.shape[-1]):
+                        if (
+                            self.moshi_vis.get_streaming_attribute("offset", 0)
+                            >= self.xa_start
+                        ):
+                            ca_src = context_injector.current_ca_src()
+                            if ca_src is None:
+                                ca_src = self.embeddings
+                        else:
+                            ca_src = None
                         tokens, gate_weight = self.moshi_vis.step(
                             codes[:, :, c : c + 1],
-                            ca_src=(
-                                self.embeddings
-                                if self.moshi_vis.get_streaming_attribute("offset", 0)
-                                >= self.xa_start
-                                else None
-                            ),
+                            ca_src=ca_src,
                         )
+                        if rag_manager is not None:
+                            rag_manager.step()
                         if tokens is None:
                             continue
                         assert (
@@ -220,6 +306,24 @@ class ServerState:
                             text_color = round(
                                 max(min((gate_weight - 0.005) / 0.016, 1.0), 0.0) * 10
                             )
+
+                            if self.omni_enabled:
+                                emit, events = monitor.consume(_text, text_token)
+                                for event in events:
+                                    log("info", f"[Omni] event: {event.kind} {event.raw!r}")
+                                    if event.kind == "rag" and rag_manager is not None:
+                                        await send_omni_text(" [RET] ", marker=10)
+                                        await rag_manager.trigger(
+                                            wait_steps=self.omni_rag_wait_steps,
+                                            handle_reference_fn=on_reference_text,
+                                            context_provider=lambda: f"moshi: {monitor.transcript}\n",
+                                        )
+                                    elif event.kind == "tool":
+                                        asyncio.create_task(dispatch_tool(event))
+                                _text = emit
+                                if not _text:
+                                    continue
+
                             msg = (
                                 b"\x07"
                                 + text_color.to_bytes(1, "big")
@@ -276,15 +380,26 @@ class ServerState:
             opus_reader = sphn.OpusStreamReader(self.mimi.sample_rate)  # type: ignore
             self.mimi.reset_streaming()
             self.moshi_vis.reset_streaming()
+            monitor.reset()
+            if rag_manager is not None:
+                rag_manager.reset()
 
-            await self.extract_image(ws)
+            await self.extract_image(ws, context_injector=context_injector)
             # Send the handshake.
             await ws.send_bytes(b"\x00")
-            await asyncio.gather(opus_loop(), recv_loop(), send_loop())
+            if rag_manager is not None:
+                async with rag_manager:
+                    await asyncio.gather(opus_loop(), recv_loop(), send_loop())
+            else:
+                await asyncio.gather(opus_loop(), recv_loop(), send_loop())
         log("info", "done with connection")
         return ws
 
-    async def extract_image(self, ws: web.WebSocketResponse) -> None:
+    async def extract_image(
+        self,
+        ws: web.WebSocketResponse,
+        context_injector: Optional[ContextInjector] = None,
+    ) -> None:
         """Embed imageat the beginning of the stream"""
         first_message = await ws.receive()
         first_message = first_message.data
@@ -309,6 +424,8 @@ class ServerState:
             self.image_encoder_model(image_tensor)["cross_attention_src"]
         )
         self.embeddings = (k.to(self.dtype), v.to(self.dtype))
+        if context_injector is not None:
+            context_injector.set_image_kv(self.embeddings)
 
 
 def start_server(
@@ -320,6 +437,14 @@ def start_server(
     dtype: Literal["float32", "bfloat16"] = "bfloat16",
     ssl: bool = True,
     ssl_cert_dir: Optional[str] = None,
+    omni_plugin: Optional[str] = None,
+    omni_rag_trigger: str = "<ret>",
+    omni_rag_timeout: float = 1.5,
+    omni_rag_max_tokens: int = 512,
+    omni_rag_wait_steps: int = 0,
+    omni_xa_injection: bool = True,
+    omni_tool_start: str = "[TOOL:",
+    omni_tool_end: str = "]",
 ) -> None:
     """Start server
 
@@ -333,6 +458,20 @@ def start_server(
     :param max_img_size: Max image size (in MB) that can be
     sent via aiohttp; If 0, no limit is set. Note that input images
     are resized in any case before being sent to the encoder
+    :param omni_plugin: Dotted Python module to import at startup. The module
+        should register a retriever (``omni.set_retriever(...)``) and any tools
+        (``@omni.tool`` / ``omni.register_tool(...)``). When set, the Omni
+        Assistant pipeline is enabled.
+    :param omni_rag_trigger: Substring that, when emitted by the model,
+        triggers asynchronous retrieval. Defaults to ``<ret>``.
+    :param omni_rag_timeout: Retrieval timeout in seconds.
+    :param omni_rag_max_tokens: Max tokens to request from the retrieval LLM.
+    :param omni_rag_wait_steps: Number of model steps to wait before firing
+        retrieval (lets the model speak some filler while we look things up).
+    :param omni_xa_injection: When True, retrieved/tool text is re-encoded
+        and concatenated with the image cross-attention KV. Experimental.
+    :param omni_tool_start: Opening marker for ``[TOOL: name(args)]`` patterns.
+    :param omni_tool_end: Closing marker.
     """
     assert kyuteye_config_path is not None
     root_dir = Path(__file__).parents[2]
@@ -383,6 +522,25 @@ def start_server(
     )
     log("info", "moshi + vision loaded")
 
+    omni_enabled = False
+    if omni_plugin:
+        log("info", f"loading omni plugin {omni_plugin!r}")
+        importlib.import_module(omni_plugin)
+        omni_enabled = True
+        retriever = get_retriever()
+        if retriever is None:
+            log(
+                "warning",
+                "omni plugin loaded but no retriever registered; RAG will be skipped",
+            )
+        else:
+            try:
+                retriever.warmup()
+            except Exception as e:
+                log("warning", f"retriever warmup failed: {e}")
+        tool_names = default_registry.names()
+        log("info", f"omni tools registered: {tool_names or '(none)'}")
+
     state = ServerState(
         mimi=mimi,
         text_tokenizer=text_tokenizer,
@@ -391,6 +549,14 @@ def start_server(
         device=device,
         dtype=torch_dtype,
         xa_start=kyuteye_config.xa_start,
+        omni_enabled=omni_enabled,
+        omni_rag_trigger=omni_rag_trigger,
+        omni_rag_timeout=omni_rag_timeout,
+        omni_rag_max_tokens=omni_rag_max_tokens,
+        omni_rag_wait_steps=omni_rag_wait_steps,
+        omni_xa_injection=omni_xa_injection,
+        omni_tool_start=omni_tool_start,
+        omni_tool_end=omni_tool_end,
     )
     log("info", "warming up the model")
     state.warmup()
