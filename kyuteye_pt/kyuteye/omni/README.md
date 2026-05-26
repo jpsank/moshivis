@@ -158,6 +158,30 @@ forward path runs with random offsets. The expected workflow is to fine-tune
 on combined visual + RAG data and ship that checkpoint; see kyutai-labs/moshi-rag
 for the ARC encoder build and training data format.
 
+### Features intentionally **not** ported from MoshiRAG
+
+The merge targets a single-batch streaming inference backend. The following
+MoshiRAG features were skipped on purpose; flag them if your fine-tune
+requires any of them:
+
+* **Classifier-free guidance (`cfg_coef != 1.0`)** -- MoshiRAG doubles the
+  batch with positive/negative conditions and interpolates logits per step.
+  MoshiVis pt has no CFG hook. A CFG-trained fine-tune will still load, but
+  inference runs as `cfg_coef=1` (the conditional branch only).
+* **`support_out_of_sync`** -- MoshiRAG's per-slot async exec-mask handling.
+  Single-batch backend doesn't need it.
+* **Depformer streaming_sum / per-codebook conditioning** -- the audio
+  depformer in this backend ignores conditioning; only the main transformer
+  consumes the streaming-sum row.
+* **`on_text_hook`, `on_audio_hook`, `on_text_logits_hook`** -- MoshiRAG's
+  per-step callbacks. The Omni `TextStreamMonitor` provides the equivalent
+  observability at a higher level.
+* **The `cross` fuser slot** -- vision owns cross-attention; the loader
+  raises if `rag.fuse2cond` routes anything to ``cross``.
+* **Local `ArcEncoder` module + `T5Conditioner`** -- the remote ARC encoder
+  service covers the runtime path and avoids pulling T5 / xformers into the
+  PyTorch backend.
+
 ## Layout
 
 ```

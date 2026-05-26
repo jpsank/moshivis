@@ -307,6 +307,16 @@ class ServerState:
                     chunk = torch.from_numpy(chunk)
                     chunk = chunk.to(device=self.device)[None, None]
                     codes = self.mimi.encode(chunk)
+                    # mimi.encode on a single PCM frame returns one time step
+                    # per call (codes shape [B, K, 1]); the loop runs once per
+                    # frame. This matches moshi-rag/inference_utils/batch_runner.py
+                    # which asserts the same invariant before iterating. The
+                    # invariant matters for the Omni streaming-sum injection:
+                    # ``MoshiVisGen.step`` consumes one queue row per call, so
+                    # the queue must be sized in frames, not codebooks.
+                    assert codes.shape[-1] == 1, (
+                        f"expected one time step per frame, got {codes.shape}"
+                    )
                     for c in range(codes.shape[-1]):
                         if (
                             self.moshi_vis.get_streaming_attribute("offset", 0)

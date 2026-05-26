@@ -382,9 +382,14 @@ class MoshiVisGen(StreamingModule):
         self.force_streaming_sum = force_streaming_sum
 
         # Pre-compute the static (per-session) condition slots from
-        # ``condition_tensors``. The MoshiRAG ``LMGen`` does the equivalent
-        # inside ``_init_streaming_state`` per batch; MoshiVis is single-batch
-        # so we resolve them once at construction time.
+        # ``condition_tensors``. MoshiRAG's ``LMGen._init_streaming_state``
+        # does the equivalent inside the per-batch state initializer because
+        # it owns CFG and per-slot reset; MoshiVis is single-batch / no-CFG so
+        # the slots are stable for the lifetime of a ``MoshiVisGen`` instance.
+        # Implication: if you ever move the model to a different device or
+        # change dtype between sessions, rebuild the ``MoshiVisGen`` rather
+        # than reuse the existing one (the static slots are pinned to the
+        # dtype/device they were initialized with).
         self._condition_sum: Optional[torch.Tensor] = None
         self._condition_cross: Optional[torch.Tensor] = None
         self._condition_prepend: Optional[torch.Tensor] = None
@@ -531,12 +536,24 @@ class MoshiVisGen(StreamingModule):
         upcoming step, or ``None`` if neither a pending queue nor a
         ``force_streaming_sum`` zero slot is active.
 
-        Mirrors MoshiRAG's ``LMGen.apply_pending_streaming_sum_condition``.
+        Equivalent to MoshiRAG's ``LMGen.apply_pending_streaming_sum_condition``
+        for the single-slot case. MoshiRAG mutates
+        ``state.condition_streaming_sum[b, 0]`` in place (writing either the
+        next pending row or zeros via ``.zero_()`` when the queue is empty);
+        we return a fresh tensor each call instead, which is functionally
+        identical for the downstream additive path in
+        :meth:`MoshiVis.forward_text` (the value is read once per step and
+        not aliased). When the queue drains and ``force_streaming_sum=True``,
+        we return the zero-init tensor, matching MoshiRAG's ``zero_()``
+        behavior. When the queue drains and ``force_streaming_sum=False``,
+        we return ``None``, matching MoshiRAG's absence of a
+        ``condition_streaming_sum`` slot in that configuration.
+
         Always called from :meth:`step`; the server does not need to call it
         directly.
         """
         pending = self.get_streaming_attribute("pending_streaming_sum", None)
-        active = self._condition_streaming_sum_init  # zeros when force_streaming_sum
+        active = self._condition_streaming_sum_init  # zeros when force_streaming_sum, else None
 
         if pending is not None and pending.shape[0] > 0:
             row = pending[0].view(1, 1, -1)
@@ -546,7 +563,7 @@ class MoshiVisGen(StreamingModule):
                 self.add_streaming_attribute("pending_streaming_sum", None)
             return row
 
-        return active  # may be None when no force_streaming_sum and queue empty
+        return active
 
     def prime(self) -> None:
         """Apply the (static) prepend condition once at session start.
