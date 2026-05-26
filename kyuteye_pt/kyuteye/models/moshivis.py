@@ -573,70 +573,107 @@ class MoshiVisGen(StreamingModule):
         )
         return k, v
 
-    def update_streaming_sum_tensor(self, tensor: Optional[torch.Tensor]) -> None:
-        """Set the pending streaming-sum queue for this session.
+    def update_streaming_sum_tensor(
+        self,
+        tensor: Optional[torch.Tensor],
+        slot_idx: int = 0,
+    ) -> None:
+        """Set the pending streaming-sum queue for one batch slot.
 
-        Single-slot equivalent of MoshiRAG's
-        ``LMGen.update_streaming_sum_tensors``. Call this when a new reference
-        becomes available (e.g. once the ARC encoder responds for an Omni RAG
-        retrieval).
+        Equivalent to MoshiRAG's ``LMGen.update_streaming_sum_tensors`` but
+        signed for explicit per-slot updates (vs. the list-of-tensors batch
+        API). Call this when a new reference becomes available (e.g. once
+        the ARC encoder responds for an Omni RAG retrieval).
 
         :param tensor: Either ``None`` (clear the queue), a ``[T, dim]`` tensor,
             or a ``[1, T, dim]`` tensor (leading batch dim is squeezed). ``T``
             is the number of streaming-sum rows; one row is consumed per
             :meth:`step` call via :meth:`apply_pending_streaming_sum_condition`.
+        :param slot_idx: Which batch slot to update. Defaults to 0 (the only
+            slot for single-stream inference). For multi-batch deployments,
+            pass the per-channel slot index.
         """
+        pending_dict = self.get_streaming_attribute(
+            "pending_streaming_sum_per_slot", {}
+        )
         if tensor is None:
-            self.add_streaming_attribute("pending_streaming_sum", None)
-            return
-        if tensor.dim() == 3 and tensor.shape[0] == 1:
-            tensor = tensor[0]
-        assert tensor.dim() == 2, f"expected [T, dim] tensor, got {tuple(tensor.shape)}"
-        assert tensor.shape[-1] == self.model_dim, (
-            f"streaming_sum dim {tensor.shape[-1]} != model dim {self.model_dim}"
-        )
-        tensor = tensor.to(
-            device=self.lm_model.device,
-            dtype=self.lm_model.llm.text_emb.weight.dtype,
-        )
-        self.add_streaming_attribute("pending_streaming_sum", tensor)
+            pending_dict.pop(slot_idx, None)
+        else:
+            if tensor.dim() == 3 and tensor.shape[0] == 1:
+                tensor = tensor[0]
+            assert tensor.dim() == 2, f"expected [T, dim] tensor, got {tuple(tensor.shape)}"
+            assert tensor.shape[-1] == self.model_dim, (
+                f"streaming_sum dim {tensor.shape[-1]} != model dim {self.model_dim}"
+            )
+            tensor = tensor.to(
+                device=self.lm_model.device,
+                dtype=self.lm_model.llm.text_emb.weight.dtype,
+            )
+            pending_dict[slot_idx] = tensor
+        self.add_streaming_attribute("pending_streaming_sum_per_slot", pending_dict)
 
-    def apply_pending_streaming_sum_condition(self) -> Optional[torch.Tensor]:
-        """Consume one row of the pending queue into the active condition slot.
+    def apply_pending_streaming_sum_condition(
+        self, batch_size: int = 1
+    ) -> Optional[torch.Tensor]:
+        """Consume one row of each per-slot queue into the active condition slot.
 
-        Returns the ``[1, 1, dim]`` tensor that should be passed to
-        :meth:`MoshiVis.forward_text` as ``streaming_sum_condition`` for the
-        upcoming step, or ``None`` if neither a pending queue nor a
-        ``force_streaming_sum`` zero slot is active.
+        Returns a ``[batch_size, 1, dim]`` tensor (or ``[2 * batch_size, 1, dim]``
+        under CFG) that should be passed to :meth:`MoshiVis.forward_text` as
+        ``streaming_sum_condition`` for the upcoming step, or ``None`` if no
+        slot has a pending queue AND the static condition slot is unset.
 
-        Equivalent to MoshiRAG's ``LMGen.apply_pending_streaming_sum_condition``
-        for the single-slot case. MoshiRAG mutates
-        ``state.condition_streaming_sum[b, 0]`` in place (writing either the
-        next pending row or zeros via ``.zero_()`` when the queue is empty);
-        we return a fresh tensor each call instead, which is functionally
-        identical for the downstream additive path in
-        :meth:`MoshiVis.forward_text` (the value is read once per step and
-        not aliased). When the queue drains and ``force_streaming_sum=True``,
-        we return the zero-init tensor, matching MoshiRAG's ``zero_()``
-        behavior. When the queue drains and ``force_streaming_sum=False``,
-        we return ``None``, matching MoshiRAG's absence of a
-        ``condition_streaming_sum`` slot in that configuration.
+        Equivalent to MoshiRAG's ``LMGen.apply_pending_streaming_sum_condition``.
+        MoshiRAG mutates ``state.condition_streaming_sum[b, 0]`` in place
+        (writing either the next pending row or zeros via ``.zero_()`` when
+        a slot's queue is empty); we build a fresh tensor each call. When a
+        slot's queue drains and ``force_streaming_sum=True``, we fill that
+        slot with the static zero tensor, matching MoshiRAG's ``zero_()``.
+        When ``force_streaming_sum=False`` and no slot has a queue, we
+        return ``None``, matching MoshiRAG's absence of a slot in that case.
 
         Always called from :meth:`step`; the server does not need to call it
         directly.
         """
-        pending = self.get_streaming_attribute("pending_streaming_sum", None)
-        active = self._condition_streaming_sum_init  # zeros when force_streaming_sum, else None
+        pending_dict: dict[int, torch.Tensor] = self.get_streaming_attribute(
+            "pending_streaming_sum_per_slot", {}
+        )
+        active = self._condition_streaming_sum_init  # [B_internal, 1, dim] or None
 
-        if pending is not None and pending.shape[0] > 0:
-            row = pending[0].view(1, 1, -1)
+        # Fast path: no queues anywhere, return the static slot.
+        if not pending_dict:
+            return active
+
+        # Build the per-slot tensor for this step. Under CFG, internal batch is
+        # 2 * user batch with pos in [:B] and null in [B:]; we only need to fill
+        # the positive half (null half stays at the static zero).
+        dim = self.model_dim
+        device = self.lm_model.device
+        dtype = self.lm_model.llm.text_emb.weight.dtype
+        internal_batch = batch_size * (2 if self._cfg else 1)
+        if active is not None:
+            out = active.clone() if active.shape[0] == internal_batch else active.expand(
+                internal_batch, -1, -1
+            ).clone()
+        else:
+            out = torch.zeros(internal_batch, 1, dim, device=device, dtype=dtype)
+
+        # Pop one row per slot that has a queue; update the dict in place.
+        new_dict = dict(pending_dict)
+        for slot_idx, pending in pending_dict.items():
+            if slot_idx >= batch_size:
+                # Stale slot from a since-released session; drop it.
+                new_dict.pop(slot_idx, None)
+                continue
+            if pending.shape[0] == 0:
+                new_dict.pop(slot_idx, None)
+                continue
+            out[slot_idx, 0] = pending[0]
             if pending.shape[0] > 1:
-                self.add_streaming_attribute("pending_streaming_sum", pending[1:])
+                new_dict[slot_idx] = pending[1:]
             else:
-                self.add_streaming_attribute("pending_streaming_sum", None)
-            return row
-
-        return active
+                new_dict.pop(slot_idx, None)
+        self.add_streaming_attribute("pending_streaming_sum_per_slot", new_dict)
+        return out
 
     def prime(self) -> None:
         """Apply the (static) prepend condition once at session start.
@@ -739,7 +776,9 @@ class MoshiVisGen(StreamingModule):
             ).all(), input_
             assert (input_[:, :1] <= lm_model.text_card).all()
 
-        streaming_sum = self.apply_pending_streaming_sum_condition()
+        streaming_sum = self.apply_pending_streaming_sum_condition(
+            batch_size=user_batch_size
+        )
         transformer_out, text_logits, gate_weight = self.lm_model.forward_text(
             input_,
             cross_attention_src=ca_src,
