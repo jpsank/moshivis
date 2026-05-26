@@ -21,35 +21,19 @@ Architecture mirrors moshi-rag's ``inference_utils/channel.py`` +
   MoshiVisGen.step, Mimi decode in one shot. Outputs are routed back to
   the originating slot's output queue.
 
-What is supported now
----------------------
+What is supported
+-----------------
 * True parallel inference for up to ``batch_size`` concurrent sessions.
+* Dynamic user join/leave: per-slot ``end_offset`` in the attention KV
+  cache and per-slot ``offsets`` in :class:`MoshiVisGen` mean that
+  acquiring a new slot mid-stream resets only that slot's history,
+  leaving other active sessions untouched. The reset is driven by a
+  one-hot ``reset_mask`` passed to :meth:`reset_streaming`.
 * Per-slot silence handling via ``exec_mask`` -- silent users don't
   consume their streaming-sum queue and don't corrupt the attention KV
-  cache for their slot (idle K/V values are preserved at the write
-  position; see ``kyuteye/modules/attention.py:KVCache.complete``).
+  cache for their slot (idle slots' ``end_offset`` stays frozen).
 * Per-slot Omni RAG: every channel has its own retriever / monitor /
   context injector, so retrieval and tool calls fire independently.
-
-What is **not** supported and is documented as a limitation
------------------------------------------------------------
-Dynamic mid-batch user join/leave needs per-slot ``end_offset`` in the
-attention KV cache and per-slot ``offset`` in :class:`MoshiVisGen` -- so
-that releasing slot ``i`` can clear *only* its KV history without
-disturbing the other active slots. The current implementation shares a
-single ``current_end`` / ``offset`` across the batch. Practical impact:
-
-* **Works**: a fixed set of N sessions start within a small time window
-  and run to completion; users may pause / resume silence freely.
-* **Does not work**: starting a new session while others are mid-stream
-  -- the new user would inherit the existing slot's KV cache state.
-
-The :meth:`BatchedServerState.acquire_slot` flow therefore refuses new
-connections once any session has produced its first output, until all
-sessions in the current batch have disconnected. A future refactor to
-per-slot ``end_offset`` (matching upstream moshi 0.2.13's ``KVCache`` and
-MoshiRAG's ``LMGen`` state) lifts this restriction; see the module
-docstring at ``kyuteye/modules/attention.py``.
 
 How to use
 ----------
@@ -178,7 +162,6 @@ class BatchedServerState:
         # Slot pool. ``None`` = free, _SlotState = occupied.
         self.slots: list[Optional[_SlotState]] = [None] * batch_size
         self._slots_lock = asyncio.Lock()
-        self._any_output_seen = False  # gates new acquires (see docstring)
 
         # The model is permanently in streaming mode at the batched size.
         self.mimi.streaming_forever(batch_size)
@@ -191,29 +174,39 @@ class BatchedServerState:
     async def acquire_slot(self, ws: web.WebSocketResponse) -> Optional[_SlotState]:
         """Reserve a free slot for ``ws``.
 
-        Returns ``None`` if the pool is full **or** if at least one slot has
-        already produced output this batch (see docstring -- mid-batch joins
-        aren't supported without per-slot reset). Caller should send a 503.
+        With per-slot ``end_offset`` in the KV cache and per-slot ``offsets``
+        in :class:`MoshiVisGen`, freshly acquired slots are reset
+        surgically (without disturbing other active sessions) via
+        :meth:`reset_streaming` with a one-hot ``reset_mask``. Returns
+        ``None`` only if the pool is genuinely full.
         """
         async with self._slots_lock:
-            if self._any_output_seen:
-                logger.warning(
-                    "[Batched] refusing new connection: batch is mid-flight "
-                    "and per-slot reset isn't supported. Wait for all current "
-                    "sessions to disconnect."
-                )
-                return None
             for i in range(self.batch_size):
                 if self.slots[i] is None:
                     slot = _SlotState(slot_idx=i, ws=ws)
                     self.slots[i] = slot
-                    logger.info("[Batched] acquired slot %d (%d/%d)", i, self._active_count(), self.batch_size)
+                    # Per-slot reset: clear only this slot's KV cache,
+                    # ``offsets``, and pending streaming-sum queue. Other
+                    # active sessions in the pool keep their state intact.
+                    reset_mask = torch.zeros(
+                        self.batch_size, dtype=torch.bool, device=self.device
+                    )
+                    reset_mask[i] = True
+                    self.mimi.reset_streaming(reset_mask=reset_mask)
+                    self.moshi_vis.reset_streaming(reset_mask=reset_mask)
+                    logger.info(
+                        "[Batched] acquired slot %d (%d/%d)",
+                        i,
+                        self._active_count(),
+                        self.batch_size,
+                    )
                     return slot
             return None
 
     async def release_slot(self, slot: _SlotState) -> None:
-        """Release ``slot``. If this is the last active session, reset the
-        model so the next batch starts clean."""
+        """Release ``slot``. Slot state is cleared on next acquire (lazy
+        reset) so we don't touch the model under contention from active
+        sessions still using it."""
         async with self._slots_lock:
             if self.slots[slot.slot_idx] is slot:
                 self.slots[slot.slot_idx] = None
@@ -224,12 +217,6 @@ class BatchedServerState:
                 self._active_count(),
                 self.batch_size,
             )
-            if self._active_count() == 0 and self._any_output_seen:
-                logger.info("[Batched] last session disconnected; resetting model state")
-                self.mimi.reset_streaming()
-                self.moshi_vis.reset_streaming()
-                self.moshi_vis.prime()
-                self._any_output_seen = False
 
     def _active_count(self) -> int:
         return sum(1 for s in self.slots if s is not None)
@@ -327,7 +314,6 @@ class BatchedServerState:
             main_pcm = self.mimi.decode(tokens[:, 1:]).cpu()
 
             for slot in active_slots:
-                self._any_output_seen = True
                 i = slot.slot_idx
                 # PCM out
                 slot.opus_writer.append_pcm(main_pcm[i, 0].numpy())
