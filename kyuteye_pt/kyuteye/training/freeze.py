@@ -156,7 +156,14 @@ def apply_freeze_recipe(
     1. Calls ``requires_grad_(False)`` on every parameter in all three
        modules.
     2. Calls ``requires_grad_(True)`` on the recipe's trainable set.
-    3. Returns a report enumerating which top-level submodules are
+    3. Syncs any ARC encoder conditioner's internal ``finetune`` flag
+       with whether its params are trainable. The conditioner does
+       ``torch.set_grad_enabled(self.finetune)`` inside its forward,
+       which would silently block gradients even when
+       ``requires_grad=True`` is set on the params. This auto-sync
+       catches the misconfiguration so the user can't accidentally
+       train against a no-grad ARC encoder.
+    4. Returns a report enumerating which top-level submodules are
        trainable vs frozen, so the caller can sanity-check.
 
     :raises KeyError: if ``recipe_name`` is not in :data:`freeze_recipes`.
@@ -174,7 +181,54 @@ def apply_freeze_recipe(
     trainable_params = list(freeze_recipes[recipe_name](moshi_vis, image_proj, moshi_vis_gen))
     for p in trainable_params:
         p.requires_grad_(True)
+    # Sync the ARC encoder's internal finetune flag if present.
+    _sync_arc_finetune(moshi_vis)
     return summarize_freeze(recipe_name, moshi_vis, image_proj, moshi_vis_gen)
+
+
+def _sync_arc_finetune(moshi_vis: nn.Module) -> None:
+    """Set ``ArcEncoderConditioner.finetune`` from its params' ``requires_grad``.
+
+    The conditioner's forward gates gradient tracking on its
+    ``finetune`` attribute (via ``torch.set_grad_enabled(self.finetune)``
+    inside ``_get_condition``). If the freeze recipe makes the
+    conditioner's params trainable but ``finetune`` stays at its
+    default ``False``, gradients are silently blocked at the
+    conditioner forward -- you'd see loss decreasing only because the
+    LM around the conditioner trains, while the ARC encoder itself
+    never updates. This helper closes the gap.
+    """
+    try:
+        from kyuteye.conditioners.arc_encoder import ArcEncoderConditioner
+    except ImportError:
+        # ARC encoder needs xformers; not all installs have it. If the
+        # import fails, no ARC conditioner can be live -- nothing to sync.
+        return
+
+    for module in moshi_vis.modules():
+        if not isinstance(module, ArcEncoderConditioner):
+            continue
+        any_trainable = any(p.requires_grad for p in module.parameters())
+        if any_trainable != module.finetune:
+            logger.info(
+                "[freeze] syncing ArcEncoderConditioner.finetune %s -> %s "
+                "based on parameters' requires_grad",
+                module.finetune,
+                any_trainable,
+            )
+            module.finetune = any_trainable
+            if any_trainable:
+                module.train()
+                if hasattr(module, "embedder"):
+                    module.embedder.train()
+                if hasattr(module, "bridge_module"):
+                    module.bridge_module.train()
+            else:
+                module.eval()
+                if hasattr(module, "embedder"):
+                    module.embedder.eval()
+                if hasattr(module, "bridge_module"):
+                    module.bridge_module.eval()
 
 
 def summarize_freeze(
