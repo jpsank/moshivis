@@ -96,6 +96,13 @@ class ConditionAttributes:
 
     @property
     def tensor_attributes(self) -> tp.Iterable[str]:
+        # NB: kyutai-labs/moshi-rag has a dormant copy-paste bug here that
+        # returns ``self.text.keys()`` (see
+        # ``moshi-rag/moshi/moshi/conditioners/base.py:92``). Neither
+        # MoshiRAG nor this port currently calls this property -- the
+        # collation paths use ``ConditionProvider.tensor_conditions``
+        # instead -- so fixing it here has no behaviour change. Kept as
+        # a paper trail in case a future caller reaches for the property.
         return self.tensor.keys()
 
     @staticmethod
