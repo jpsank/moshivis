@@ -21,7 +21,11 @@ Importing this package does NOT require a GPU. The trainer itself, once
 written, will.
 """
 
-from kyuteye.training.collator import CollatedBatch, RagDataCollator
+from kyuteye.training.collator import (
+    CollatedBatch,
+    RagDataCollator,
+    make_live_image_encoder,
+)
 from kyuteye.training.dataset import RagExample, RagJsonlDataset, RagTurn
 from kyuteye.training.distributed import (
     DistributedContext,
@@ -71,6 +75,7 @@ __all__ = [
     "init_distributed",
     "is_main_process",
     "log_eval",
+    "make_live_image_encoder",
     "next_token_ce_loss",
     "summarize_freeze",
 ]

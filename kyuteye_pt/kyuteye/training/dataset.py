@@ -64,10 +64,17 @@ class RagExample:
         text-only RAG dialogues.
     :param turns: Ordered list of turns. The trainer is responsible for
         flattening into the next-token prediction targets.
+    :param index: Stable dataset-global index, populated by
+        :class:`RagJsonlDataset` when the file is loaded. Used by the
+        collator to look up per-example pre-encoded audio codes by
+        deterministic name (``{index}.pt``) instead of the in-batch
+        position (which is wrong after shuffling -- the original bug
+        this field fixes).
     """
 
     image_path: Optional[str]
     turns: list[RagTurn]
+    index: Optional[int] = None
 
     @classmethod
     def from_dict(cls, raw: dict) -> "RagExample":
@@ -81,6 +88,7 @@ class RagExample:
                 )
                 for t in raw.get("turns", [])
             ],
+            index=raw.get("index"),
         )
 
     def moshi_turn_count(self) -> int:
@@ -123,6 +131,12 @@ class RagJsonlDataset(Dataset):  # type: ignore[misc]
             paths = [Path(p) for p in path]
 
         examples: list[RagExample] = []
+        # Global counter across all files so audio-code lookup
+        # (``{index}.pt``) remains stable. We assign indices to ALL
+        # records, even filtered ones, so callers running with and
+        # without ``filter_no_rag`` see the same index for the same
+        # JSONL line -- audio pre-encoding done once can be reused.
+        global_idx = 0
         for p in paths:
             with open(p) as f:
                 for line in f:
@@ -130,6 +144,12 @@ class RagJsonlDataset(Dataset):  # type: ignore[misc]
                     if not line:
                         continue
                     ex = RagExample.from_dict(json.loads(line))
+                    # Honour any explicit "index" field in the JSONL (rare;
+                    # mostly for resumed preprocessing). Default: the
+                    # global running counter.
+                    if ex.index is None:
+                        ex.index = global_idx
+                    global_idx += 1
                     if filter_no_rag and not ex.has_rag():
                         continue
                     if require_image and not ex.has_image():

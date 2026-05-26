@@ -29,6 +29,7 @@ def next_token_ce_loss(
     loss_mask: Optional[torch.Tensor] = None,
     ignore_index: int = -100,
     label_smoothing: float = 0.0,
+    shift_targets: bool = True,
 ) -> torch.Tensor:
     """Standard masked next-token CE loss.
 
@@ -46,6 +47,14 @@ def next_token_ce_loss(
     :param ignore_index: Token id treated as "no loss" by
         ``F.cross_entropy``. Default ``-100``.
     :param label_smoothing: Passed through to ``F.cross_entropy``.
+    :param shift_targets: When True (default), align logits and targets
+        for next-token prediction: ``logits[:, t]`` is scored against
+        ``targets[:, t+1]``. Implemented by slicing ``logits[:, :-1]``
+        and ``targets[:, 1:]`` (and ``loss_mask[:, 1:]``). When False,
+        compare position-by-position -- only correct for tasks where
+        the model's output at position ``t`` is already aligned with
+        the target at position ``t`` (e.g. classification heads or
+        pre-shifted data).
 
     :return: Scalar tensor, mean CE over the non-ignored positions.
     """
@@ -59,6 +68,25 @@ def next_token_ce_loss(
     assert target_text_tokens.shape == (B, T), (
         f"target shape {tuple(target_text_tokens.shape)} != logits batch/time {(B, T)}"
     )
+
+    if shift_targets:
+        # Next-token alignment: logits[:, t] predicts target[:, t+1].
+        if T < 2:
+            # Degenerate batch (single position) has no next-token signal.
+            return torch.zeros(
+                (),
+                device=text_logits.device,
+                dtype=torch.float32,
+                requires_grad=text_logits.requires_grad,
+            )
+        text_logits = text_logits[:, :-1].contiguous()
+        target_text_tokens = target_text_tokens[:, 1:].contiguous()
+        if loss_mask is not None:
+            assert loss_mask.shape == (B, T), (
+                f"loss_mask shape {tuple(loss_mask.shape)} != {(B, T)}"
+            )
+            loss_mask = loss_mask[:, 1:].contiguous()
+        B, T, card = text_logits.shape  # update for downstream asserts
 
     targets = target_text_tokens
     if loss_mask is not None:
