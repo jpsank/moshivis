@@ -1,7 +1,7 @@
 """Moshi the little AI"""
 
 from functools import partial
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 import torch
 from kyuteye.conditioners import (
@@ -404,6 +404,13 @@ class MoshiVisGen(StreamingModule):
         condition_tensors: Optional[ConditionTensors] = None,
         force_streaming_sum: bool = False,
         cfg_coef: float = 1.0,
+        null_condition_tensors: Optional[ConditionTensors] = None,
+        cfg_is_masked_until: Optional[List[int]] = None,
+        cfg_is_no_text: bool = False,
+        on_text_hook: Optional[Callable[[torch.Tensor], None]] = None,
+        on_text_logits_hook: Optional[Callable[[torch.Tensor], None]] = None,
+        on_audio_hook: Optional[Callable[[torch.Tensor], None]] = None,
+        support_out_of_sync: bool = False,
     ):
         """Initialize a streaming-inference wrapper.
 
@@ -413,6 +420,32 @@ class MoshiVisGen(StreamingModule):
             are interpolated as ``null + (pos - null) * cfg_coef`` before
             sampling. Requires conditioner-dropout training to be useful at
             inference. Memory cost: 2x KV cache. Compute cost: 2x forward.
+        :param null_condition_tensors: Optional MoshiRAG-parity hook to supply
+            the null-branch ConditionTensors explicitly (matches the way
+            MoshiRAG's ``LMGen._init_streaming_state`` expects pre-supplied
+            2x conditions). When ``None`` (default), the null branch is built
+            by zeroing every attribute of ``condition_tensors`` (uniform-drop
+            null pattern). Set this if the fine-tune was trained with a
+            non-uniform conditioner dropout.
+        :param cfg_is_masked_until: Optional per-codebook list of step thresholds
+            below which the null branch's input tokens are zeroed (mirrors
+            MoshiRAG ``LMGen`` line 807). Used by some CFG-trained models
+            where the null branch should not see audio history below a delay.
+        :param cfg_is_no_text: When ``True``, the null branch's text token is
+            forced to ``zero_token_id`` on every step and the positive branch's
+            text logits are used directly (no interpolation on text). Mirrors
+            MoshiRAG ``LMGen`` line 815.
+        :param on_text_hook: Optional callback ``fn(text_token: [B] long tensor)``
+            invoked right after text-token sampling each step. Receives the
+            user-batch-sized sampled token tensor.
+        :param on_text_logits_hook: Optional callback ``fn(text_logits)``
+            invoked right after CFG interpolation, before sampling.
+        :param on_audio_hook: Optional callback ``fn(audio_tokens)`` invoked
+            right after depformer sampling completes for the step.
+        :param support_out_of_sync: When ``True``, the warmup-phase early-return
+            (``offset <= max_delay``) is skipped so callers always get an output
+            tensor back. Matches MoshiRAG's flag at ``lm.py:577``; useful for
+            batched deployments where different slots are at different offsets.
         """
         assert not moshi_vis.training, "generation shouldn't be used in training mode."
         super().__init__()
@@ -435,6 +468,27 @@ class MoshiVisGen(StreamingModule):
         self.force_streaming_sum = force_streaming_sum
         self.cfg_coef = cfg_coef
         self._cfg = cfg_coef != 1.0
+        self.cfg_is_masked_until = cfg_is_masked_until
+        self.cfg_is_no_text = cfg_is_no_text
+        self.on_text_hook = on_text_hook
+        self.on_text_logits_hook = on_text_logits_hook
+        self.on_audio_hook = on_audio_hook
+        self.support_out_of_sync = support_out_of_sync
+        self._null_condition_tensors = null_condition_tensors
+
+        if cfg_is_masked_until is not None:
+            assert self._cfg, (
+                "cfg_is_masked_until requires cfg_coef != 1.0"
+            )
+            assert len(cfg_is_masked_until) == moshi_vis.num_codebooks, (
+                f"cfg_is_masked_until length {len(cfg_is_masked_until)} must "
+                f"match num_codebooks {moshi_vis.num_codebooks}"
+            )
+            self._cfg_is_masked_until = torch.tensor(
+                cfg_is_masked_until, dtype=torch.long, device=self.lm_model.device
+            )
+        else:
+            self._cfg_is_masked_until = None
 
         # Pre-compute the static (per-session) condition slots from
         # ``condition_tensors``. MoshiRAG's ``LMGen._init_streaming_state``
@@ -461,7 +515,13 @@ class MoshiVisGen(StreamingModule):
             # :meth:`step`. Mirrors MoshiRAG's ``LMGen._init_streaming_state``
             # when ``cfg_coef != 1.0``.
             if self._cfg:
-                null_tensors = _dropped_condition_tensors(condition_tensors)
+                # Use caller-supplied null branch if any (MoshiRAG parity),
+                # else fall back to the auto-drop pattern.
+                null_tensors = (
+                    self._null_condition_tensors
+                    if self._null_condition_tensors is not None
+                    else _dropped_condition_tensors(condition_tensors)
+                )
                 for name, fuse_method in (
                     ("_condition_sum", "sum"),
                     ("_condition_cross", "cross"),
@@ -593,6 +653,14 @@ class MoshiVisGen(StreamingModule):
             slot for single-stream inference). For multi-batch deployments,
             pass the per-channel slot index.
         """
+        # MoshiRAG ``LMGen.update_streaming_sum_tensors`` (line 737) asserts the
+        # same -- per-slot streaming-sum is only defined under cfg_coef=1.0
+        # because under CFG the streaming-sum input is doubled (pos+null) and
+        # the per-slot semantics for the null branch aren't specified by the
+        # training setup.
+        assert self.cfg_coef == 1.0, (
+            "Per-slot streaming_sum update requires cfg_coef == 1.0"
+        )
         pending_dict = self.get_streaming_attribute(
             "pending_streaming_sum_per_slot", {}
         )
@@ -803,7 +871,14 @@ class MoshiVisGen(StreamingModule):
                 current_input_cache[:, k, position] = self.initial_token[:, k, 0]
 
         # Transformer forward
-        input_ = current_input_cache[:, :, position : position + 1]
+        # Strip the CFG-doubled portion (input_ ends up [pos_batch, K, 1]; under
+        # CFG we re-derive the null half from input_ below so we can apply
+        # ``cfg_is_masked_until`` / ``cfg_is_no_text`` masking before doubling.
+        if self._cfg:
+            pos_input = current_input_cache[:user_batch_size, :, position : position + 1]
+        else:
+            pos_input = current_input_cache[:, :, position : position + 1]
+        input_ = pos_input
 
         if self.check:
             # Check that we are not feeding in any value that is not generated yet.
@@ -815,6 +890,38 @@ class MoshiVisGen(StreamingModule):
                 input_[:, lm_model.audio_offset :] <= lm_model.audio_card
             ).all(), input_
             assert (input_[:, :1] <= lm_model.text_card).all()
+
+        # Build the CFG-doubled input with optional masking on the null branch.
+        # Mirrors ``moshi-rag/moshi/moshi/models/lm.py`` lines 805-816.
+        if self._cfg:
+            zero_tok = torch.full(
+                (1,),
+                self.lm_model.zero_token_id,
+                dtype=torch.long,
+                device=input_.device,
+            )
+            # is_init: positions that are still in the warmup / delay window
+            # (where the cache holds an init token rather than a real one).
+            is_init = current_offset <= torch.tensor(
+                lm_model.delays, dtype=torch.long, device=input_.device
+            ).view(1, -1, 1)
+            if self._cfg_is_masked_until is not None:
+                limit = (
+                    torch.tensor(lm_model.delays, dtype=torch.long, device=input_.device).view(1, -1, 1)
+                    + self._cfg_is_masked_until.view(1, -1, 1)
+                )
+                is_zeroed = current_offset <= limit
+                masked = torch.where(is_zeroed & ~is_init, zero_tok, input_)
+                input_doubled = torch.cat([input_, masked], dim=0)
+            else:
+                input_doubled = input_.repeat(2, 1, 1)
+            if self.cfg_is_no_text:
+                # Force null branch's text token to zero whenever it isn't an init slot.
+                null_text = input_doubled[user_batch_size:, :1]
+                input_doubled[user_batch_size:, :1] = torch.where(
+                    ~is_init[:, :1], zero_tok, null_text
+                )
+            input_ = input_doubled
 
         streaming_sum = self.apply_pending_streaming_sum_condition(
             batch_size=user_batch_size
@@ -831,7 +938,14 @@ class MoshiVisGen(StreamingModule):
         # because :meth:`depformer_step` does its own CFG handling.
         if self._cfg:
             pos_logits, null_logits = text_logits.chunk(2, dim=0)
-            text_logits = null_logits + (pos_logits - null_logits) * self.cfg_coef
+            if self.cfg_is_no_text:
+                # No-text mode: use the positive branch's text logits directly.
+                text_logits = pos_logits
+            else:
+                text_logits = null_logits + (pos_logits - null_logits) * self.cfg_coef
+
+        if self.on_text_logits_hook is not None:
+            self.on_text_logits_hook(text_logits)
 
         # Sample text tokens
         # Shape of text_logits should be [user_batch_size, K_text=1, T=1, Card_text]
@@ -845,9 +959,13 @@ class MoshiVisGen(StreamingModule):
         assert text_token.shape[2] == 1
         assert text_token.shape[1] == 1, "Only one text stream supported."
         text_token = text_token[:, 0, 0]  # shape is [user_batch_size]
+        if self.on_text_hook is not None:
+            self.on_text_hook(text_token)
 
         # Generate and sample audio tokens
         audio_tokens = self.depformer_step(text_token, transformer_out)
+        if self.on_audio_hook is not None:
+            self.on_audio_hook(audio_tokens)
 
         # Write generated tokens
         current_offset += 1
@@ -876,8 +994,10 @@ class MoshiVisGen(StreamingModule):
         )
 
         # if <= max_delay, we continue partial-generation
-        # until removing all ungenerated tokens
-        if current_offset <= self.max_delay:
+        # until removing all ungenerated tokens. ``support_out_of_sync`` lifts
+        # this guard for multi-slot batched deployments where each slot may
+        # be at a different offset and the caller wants tokens back unconditionally.
+        if not self.support_out_of_sync and current_offset <= self.max_delay:
             self.add_streaming_attribute("cache", current_input_cache)
             self.add_streaming_attribute("offset", current_offset)
             return None, 0.0
