@@ -50,6 +50,7 @@ from kyuteye.training.logging_hooks import (
 )
 from kyuteye.training.loss import next_token_ce_loss
 from kyuteye.training.trainer import Trainer, TrainerConfig
+from kyuteye.training.training_module import TrainingForward
 
 __all__ = [
     "CollatedBatch",
@@ -65,6 +66,7 @@ __all__ = [
     "TensorBoardLogger",
     "Trainer",
     "TrainerConfig",
+    "TrainingForward",
     "WandbLogger",
     "apply_freeze_recipe",
     "barrier",

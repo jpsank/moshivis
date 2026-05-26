@@ -60,7 +60,6 @@ import torch.nn.functional as F
 from torch.cuda.amp import GradScaler  # noqa: F401  # retained for the float16 fallback
 from torch.utils.data import DataLoader
 
-from kyuteye.conditioners import dropout_all_conditions
 from kyuteye.training.collator import CollatedBatch, RagDataCollator
 from kyuteye.training.dataset import RagJsonlDataset
 from kyuteye.training.distributed import (
@@ -70,7 +69,7 @@ from kyuteye.training.distributed import (
 )
 from kyuteye.training.logging_hooks import Logger as _RunLogger
 from kyuteye.training.logging_hooks import build_loggers
-from kyuteye.training.loss import next_token_ce_loss
+from kyuteye.training.training_module import TrainingForward
 
 if TYPE_CHECKING:
     from kyuteye.models.image_projection import ImageProjection
@@ -156,18 +155,27 @@ class Trainer:
             "float32": torch.float32,
         }[self.config.dtype]
 
-        # DDP wrapping. We wrap the MoshiVis backbone; the image encoder
-        # is not in the gradient graph for the adapter recipe (frozen)
-        # but is wrapped too if any of its params are trainable.
-        self.moshi_vis = self._maybe_wrap_ddp(self.moshi_vis)
-        self.image_proj = self._maybe_wrap_ddp(self.image_proj)
+        # DDP wrapping: bundle MoshiVis + ImageProjection in a single
+        # ``TrainingForward`` wrapper module so DDP's reducer sees the
+        # whole forward graph in one ``__call__``. Bypassing
+        # ``DDP.__call__`` (by accessing ``.module`` and calling
+        # ``forward_text`` directly) skips ``prepare_for_backward``,
+        # which under ``find_unused_parameters=True`` causes the next
+        # ``backward`` to hang waiting for grads on params that
+        # actually didn't participate. The wrapper has a single
+        # ``forward(batch)`` method that the trainer calls through DDP.
+        self.training_model = TrainingForward(
+            moshi_vis=self.moshi_vis,
+            image_proj=self.image_proj,
+        )
+        self.training_model = self._maybe_wrap_ddp(self.training_model)
+        # ``moshi_vis`` / ``image_proj`` attributes are still useful for
+        # checkpoint save/load; they're just no longer separately wrapped.
 
-        # Optimizer + scheduler over the trainable params.
+        # Optimizer + scheduler over the trainable params. The wrapper
+        # holds both submodules so ``parameters()`` yields the union.
         trainable_params = [
-            p
-            for p in list(self.moshi_vis.parameters())
-            + list(self.image_proj.parameters())
-            if p.requires_grad
+            p for p in self.training_model.parameters() if p.requires_grad
         ]
         if not trainable_params:
             raise RuntimeError(
@@ -302,13 +310,14 @@ class Trainer:
                 loss.backward()
                 accumulated_loss += loss.item()
 
-            # Gradient clip + step.
+            # Gradient clip + step. ``training_model`` holds both
+            # ``moshi_vis`` and ``image_proj`` as submodules so a single
+            # parameters() walk covers everything that DDP synced.
             if self.config.grad_clip_norm > 0:
                 torch.nn.utils.clip_grad_norm_(
                     [
                         p
-                        for p in list(self.moshi_vis.parameters())
-                        + list(self.image_proj.parameters())
+                        for p in self.training_model.parameters()
                         if p.requires_grad
                     ],
                     self.config.grad_clip_norm,
@@ -361,272 +370,141 @@ class Trainer:
             epoch += 1
 
     # ------------------------------------------------------------------ forward
-    def _build_conditioning(
-        self,
-        condition_attributes: list,
-        device: torch.device,
-        inner_model: "MoshiVis",
-        *,
-        text_input_ids: Optional[torch.Tensor] = None,
-    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Build per-method conditioning tensors for the training forward.
+    def _cfg_dropout_decision(self) -> bool:
+        """Return a per-step CFG dropout decision that's identical across ranks.
 
-        Calls the model's ``condition_provider`` to encode the
-        :class:`ConditionAttributes` list, then the ``fuser`` to route the
-        results into the per-method slots. The ``streaming_sum`` output
-        is handled differently depending on ``per_step_streaming_sum``:
-
-        * When ``False`` (default), the [B, T_ref, dim] streaming-sum
-          tensor is mean-pooled over its sequence dim and folded into
-          ``sum_condition`` so it broadcasts over the LM's full training
-          sequence. Simpler; the ARC encoder still gets gradient signal
-          but per-step temporal alignment is lost.
-        * When ``True`` AND ``text_input_ids`` is given, the streaming-
-          sum rows are placed at the LM positions immediately following
-          each ``<ret>`` token, producing a ``[B, T_lm, dim]`` tensor that
-          ``MoshiVis.forward_text`` accepts in its multi-step path. This
-          mirrors MoshiRAG's per-step inference semantics during training.
-
-        Returns ``(sum_condition, cross_condition_from_fuser,
-        streaming_sum_per_step)``. The third element is ``None`` unless
-        the per-step path is active.
+        Each rank's RNG state diverges (we seed ``self.config.seed +
+        ctx.rank`` per-rank for data shuffling). Using ``torch.rand(())``
+        here would give different decisions per rank -> different
+        forward shapes / dropped-conditions -> DDP all-reduce mismatch
+        and corrupted gradients. We instead derive the decision
+        deterministically from ``(step, seed)`` so every rank agrees.
         """
-        if (
-            inner_model.condition_provider is None
-            or inner_model.fuser is None
-            or not condition_attributes
-        ):
-            return None, None, None
+        if self.config.cfg_dropout_p <= 0:
+            return False
+        h = hash((self.step, self.config.seed)) & 0xFFFFFFFF
+        return (h / 0xFFFFFFFF) < self.config.cfg_dropout_p
 
-        prepared = inner_model.condition_provider.prepare(condition_attributes)
-        condition_tensors = inner_model.condition_provider(prepared)
+    # NB: ``_build_streaming_sum_per_step`` and ``_build_conditioning``
+    # used to live here; they've moved to
+    # ``kyuteye.training.training_module.TrainingForward`` so they
+    # execute inside DDP's ``__call__`` (which fixes the
+    # ``find_unused_parameters`` hang the previous design caused).
 
-        sum_cond = inner_model.fuser.get_sum(condition_tensors)
-        streaming_sum = inner_model.fuser.get_streaming_sum(condition_tensors)
-        cross_cond = inner_model.fuser.get_cross(condition_tensors)
-
-        streaming_sum_per_step: Optional[torch.Tensor] = None
-        if streaming_sum is not None and streaming_sum.shape[1] > 0:
-            rag_token_id = getattr(inner_model, "rag_token_id", None)
-            if (
-                self.config.per_step_streaming_sum
-                and text_input_ids is not None
-                and rag_token_id is not None
-            ):
-                # Per-step path: align reference rows to <ret> positions.
-                streaming_sum_per_step = self._build_streaming_sum_per_step(
-                    text_input_ids=text_input_ids,
-                    reference_embeddings=streaming_sum,
-                    rag_token_id=rag_token_id,
-                )
-            else:
-                # Mean-pool fallback: broadcastable across all LM positions.
-                streaming_sum_pooled = streaming_sum.mean(dim=1, keepdim=True)
-                if sum_cond is None:
-                    sum_cond = streaming_sum_pooled
-                else:
-                    sum_cond = sum_cond + streaming_sum_pooled.to(sum_cond)
-
-        return sum_cond, cross_cond, streaming_sum_per_step
-
-    def _build_streaming_sum_per_step(
-        self,
-        *,
-        text_input_ids: torch.Tensor,
-        reference_embeddings: torch.Tensor,
-        rag_token_id: int,
-    ) -> torch.Tensor:
-        """Align reference embeddings to per-position streaming-sum rows.
-
-        For each example, find the first ``<ret>`` token position in
-        ``text_input_ids[b]`` and copy ``reference_embeddings[b]`` to
-        ``[ret_pos + 1, ret_pos + 1 + T_ref)`` in the output. Positions
-        outside that window stay at zero. If an example has no
-        ``<ret>``, the output is all zeros for that row (the LM just
-        gets no reference signal -- which is the desired behavior).
-
-        :param text_input_ids: ``[B, T_lm]`` long tensor of text tokens
-            (channel 0 of the model's ``input_ids``).
-        :param reference_embeddings: ``[B, T_ref, dim]`` float tensor
-            from the fuser's ``get_streaming_sum``.
-        :param rag_token_id: SentencePiece token id of the learned
-            ``<ret>`` token. Lives on ``MoshiVis.rag_token_id`` when the
-            model was configured with one; ``None`` in that field
-            disables this path (and we fall back to mean-pool).
-        """
-        B, T_lm = text_input_ids.shape
-        _, T_ref, dim = reference_embeddings.shape
-        out = torch.zeros(
-            B,
-            T_lm,
-            dim,
-            device=reference_embeddings.device,
-            dtype=reference_embeddings.dtype,
-        )
-        ret_mask = text_input_ids == rag_token_id  # [B, T_lm]
-        for b in range(B):
-            positions = ret_mask[b].nonzero(as_tuple=False).flatten()
-            if positions.numel() == 0:
-                continue
-            ret_pos = int(positions[0].item())
-            start = ret_pos + 1
-            end = min(start + T_ref, T_lm)
-            length = max(0, end - start)
-            if length > 0:
-                out[b, start:end] = reference_embeddings[b, :length]
-        return out
 
     def _forward_one_microbatch(self, batch: CollatedBatch) -> torch.Tensor:
         """Forward one micro-batch and return the (unscaled) loss.
 
-        Builds per-batch ``sum_condition`` via the condition provider
-        and fuser (collapsing ``streaming_sum`` into ``sum`` for
-        training; see :meth:`_build_conditioning`). Applies CFG
-        conditioner dropout when ``cfg_dropout_p > 0`` -- with that
-        probability, the entire batch's ConditionAttributes are
-        replaced with their dropped (all-attributes-nulled) version
-        before being passed through the provider/fuser. The model
-        therefore learns both ``p(x | condition)`` and ``p(x | null)``
-        distributions, which is what makes inference-time CFG sampling
-        produce meaningful interpolations.
+        Dispatches to ``self.training_model(...)``, which is the
+        DDP-wrapped :class:`TrainingForward` -- a single ``forward``
+        method that does conditioning + LM forward + masked CE loss.
+        Routing through DDP's ``__call__`` is required for
+        ``find_unused_parameters=True`` to correctly prime the reducer;
+        bypassing it caused next-step ``backward()`` hangs.
+
+        CFG dropout decision is made here (not inside the wrapper) so
+        it can be deterministic across DDP ranks -- see
+        :meth:`_cfg_dropout_decision`.
         """
-        device = self.ctx.device
-        input_ids = batch.input_ids.to(device)
-        target_text = batch.target_text.to(device)
-        loss_mask = batch.loss_mask.to(device)
-        cross_attention_src = (
-            batch.cross_attention_src.to(device)
-            if batch.cross_attention_src is not None
-            else None
-        )
-
-        # CFG dropout: replace the entire batch's ConditionAttributes with
-        # their nullified version with probability ``cfg_dropout_p``. The
-        # gating is per-batch (not per-example) because the provider's
-        # batch handling is collated -- mixing pos+null in one batch
-        # would require splitting the forward, which loses parallelism.
-        # Per-example mixing can be achieved by simply running two
-        # smaller batches in alternation, which the dataloader does
-        # naturally over training steps.
-        condition_attrs = batch.condition_attributes
-        if (
-            self.config.cfg_dropout_p > 0
-            and torch.rand(()).item() < self.config.cfg_dropout_p
-        ):
-            condition_attrs = dropout_all_conditions(condition_attrs)
-
-        # Inner model under DDP wrapper: forward_text is on the underlying
-        # MoshiVis, not the DDP wrapper directly. ``.module`` accesses it.
-        inner = (
-            self.moshi_vis.module
-            if hasattr(self.moshi_vis, "module")
-            else self.moshi_vis
-        )
-
-        # Per-step streaming-sum requires the text input ids to find <ret>
-        # positions; pass them in so the conditioning builder can align.
-        sum_condition, fuser_cross, streaming_sum_per_step = self._build_conditioning(
-            condition_attrs,
-            device,
-            inner,
-            text_input_ids=input_ids[:, 0],
-        )
-
-        # Resolve the cross-attention source: prefer the explicit image
-        # KV (vision path) over the fuser's ``cross`` output. The loader
-        # rejects the collision at config-load time when vision XA is
-        # also enabled, so by the time we get here the two paths are
-        # mutually exclusive in practice.
-        ca_src: Optional[torch.Tensor] = cross_attention_src
-        if ca_src is None and fuser_cross is not None:
-            ca_src = fuser_cross.to(device)
-
+        batch = batch.to(self.ctx.device)
+        cfg_dropout = self._cfg_dropout_decision()
         with torch.autocast(
-            device_type=device.type,
+            device_type=self.ctx.device.type,
             dtype=self._dtype,
             enabled=self._dtype != torch.float32,
         ):
-            transformer_out, text_logits, _gate = inner.forward_text(
-                input_ids=input_ids,
-                cross_attention_src=ca_src,
-                sum_condition=sum_condition.to(device)
-                if sum_condition is not None
-                else None,
-                streaming_sum_condition=streaming_sum_per_step.to(device)
-                if streaming_sum_per_step is not None
-                else None,
-            )
-            # text_logits comes out as [B, K_text=1, T, card]. Squeeze K_text.
-            text_logits = text_logits.squeeze(1)
-            loss = next_token_ce_loss(
-                text_logits=text_logits,
-                target_text_tokens=target_text,
-                loss_mask=loss_mask,
+            loss = self.training_model(
+                batch,
+                cfg_dropout=cfg_dropout,
+                per_step_streaming_sum=self.config.per_step_streaming_sum,
             )
         return loss
 
     # ------------------------------------------------------------------ ckpt
+    def _training_inner(self) -> "TrainingForward":
+        """Unwrap DDP if present and return the underlying ``TrainingForward``."""
+        return (
+            self.training_model.module
+            if hasattr(self.training_model, "module")
+            else self.training_model
+        )
+
     def _save(self) -> None:
         if not is_main_process(self.ctx):
             return
         path = self.save_dir / f"step_{self.step:08d}"
         path.mkdir(parents=True, exist_ok=True)
-        inner_mv = (
-            self.moshi_vis.module
-            if hasattr(self.moshi_vis, "module")
-            else self.moshi_vis
-        )
-        inner_ip = (
-            self.image_proj.module
-            if hasattr(self.image_proj, "module")
-            else self.image_proj
-        )
+        inner = self._training_inner()
         torch.save(
             {
                 "step": self.step,
-                "moshi_vis": inner_mv.state_dict(),
-                "image_proj": inner_ip.state_dict(),
+                "moshi_vis": inner.moshi_vis.state_dict(),
+                "image_proj": inner.image_proj.state_dict(),
                 "optimizer": self.optimizer.state_dict(),
                 "scheduler": self.scheduler.state_dict(),
                 "config": self.config.__dict__,
             },
             path / "ckpt.pt",
         )
-        # Update the "latest" pointer so resume is one file lookup away.
-        latest = self.save_dir / "latest"
-        latest.unlink(missing_ok=True)
-        latest.symlink_to(path.name)
+        # Update the "latest" pointer. Try a symlink first; fall back to a
+        # plain text file naming the target dir (some HPC filesystems --
+        # certain Lustre + GPFS configs -- don't permit symlinks). The
+        # resume code reads either form.
+        latest_link = self.save_dir / "latest"
+        latest_link.unlink(missing_ok=True)
+        try:
+            latest_link.symlink_to(path.name)
+        except (OSError, NotImplementedError) as e:
+            logger.warning(
+                "[trainer] symlink to latest failed (%s); using latest.txt fallback",
+                e,
+            )
+            (self.save_dir / "latest.txt").write_text(path.name + "\n")
         logger.info("[trainer] saved checkpoint to %s", path)
 
     def _resume(self, resume_dir: str) -> None:
-        """Load the latest checkpoint inside ``resume_dir`` if any."""
+        """Load the latest checkpoint inside ``resume_dir`` if any.
+
+        Resolution order for finding "latest":
+          1. ``resume_dir/latest`` symlink (preferred, atomic via
+             unlink + symlink_to).
+          2. ``resume_dir/latest.txt`` plain text fallback (some
+             HPC filesystems don't permit symlinks).
+          3. Highest-numbered ``step_*`` subdirectory (sorted by name).
+        """
         rdir = Path(resume_dir)
-        latest = rdir / "latest"
-        if latest.exists():
-            target = (rdir / latest.readlink()).resolve()
+        latest_link = rdir / "latest"
+        latest_txt = rdir / "latest.txt"
+        ckpt_path: Optional[Path] = None
+        if latest_link.is_symlink() or latest_link.exists():
+            target = (rdir / latest_link.readlink()).resolve()
             ckpt_path = target / "ckpt.pt"
+        elif latest_txt.exists():
+            target_name = latest_txt.read_text().strip()
+            ckpt_path = rdir / target_name / "ckpt.pt"
         else:
-            # Fall back to the highest step_* directory.
             candidates = sorted(rdir.glob("step_*"))
             if not candidates:
-                logger.warning("[trainer] resume_dir has no checkpoints, starting fresh")
+                logger.warning(
+                    "[trainer] resume_dir %s has no checkpoints, starting fresh",
+                    rdir,
+                )
                 return
             ckpt_path = candidates[-1] / "ckpt.pt"
 
+        if not ckpt_path.exists():
+            logger.warning("[trainer] resolved checkpoint %s does not exist", ckpt_path)
+            return
+
+        # ``weights_only=True`` accepts dict[str, Tensor] and the basic
+        # numeric/string types we put in the ``config`` dict; safe to use
+        # here. If the checkpoint format ever grows non-serializable
+        # entries, flip this to False (with the usual security caveat).
         state = torch.load(ckpt_path, map_location="cpu", weights_only=True)
         self.step = int(state["step"])
-        inner_mv = (
-            self.moshi_vis.module
-            if hasattr(self.moshi_vis, "module")
-            else self.moshi_vis
-        )
-        inner_ip = (
-            self.image_proj.module
-            if hasattr(self.image_proj, "module")
-            else self.image_proj
-        )
-        inner_mv.load_state_dict(state["moshi_vis"], strict=False)
-        inner_ip.load_state_dict(state["image_proj"], strict=False)
+        inner = self._training_inner()
+        inner.moshi_vis.load_state_dict(state["moshi_vis"], strict=False)
+        inner.image_proj.load_state_dict(state["image_proj"], strict=False)
         self.optimizer.load_state_dict(state["optimizer"])
         self.scheduler.load_state_dict(state["scheduler"])
         if is_main_process(self.ctx):

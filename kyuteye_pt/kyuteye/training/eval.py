@@ -36,7 +36,6 @@ from torch.utils.data import DataLoader
 from kyuteye.training.collator import RagDataCollator
 from kyuteye.training.dataset import RagJsonlDataset
 from kyuteye.training.distributed import DistributedContext, is_main_process
-from kyuteye.training.loss import next_token_ce_loss
 
 if TYPE_CHECKING:
     from kyuteye.models.image_projection import ImageProjection
@@ -73,20 +72,18 @@ def evaluate(
 ) -> EvalResult:
     """Run the trainer's forward pass over ``dataset`` and aggregate CE loss.
 
-    Operates through the trainer instance so all of its plumbing
-    (conditioning builder, mixed precision dtype, DDP module unwrap,
-    per-step streaming-sum) is reused. The trainer is left at the same
-    step + optimizer state on return -- this is purely read-only.
+    Calls ``trainer.training_model`` directly under ``no_grad`` so the
+    exact same conditioning + LM forward + masked loss runs in eval as
+    in training -- including per-step streaming-sum if you trained with
+    it. CFG dropout is forced off during eval. The trainer's
+    optimizer/scheduler state is left untouched (this is purely
+    read-only).
 
     :param max_batches: Cap on number of eval batches (useful for fast
         validation passes during long training runs). ``None`` runs
         the full dataset.
     """
-    # Switch to eval mode and back so dropout / batchnorm semantics are
-    # correct. ``DistributedDataParallel`` proxies ``.eval()`` /
-    # ``.train()`` to the wrapped module.
-    trainer.moshi_vis.eval()
-    trainer.image_proj.eval()
+    trainer.training_model.eval()
     try:
         dataloader = DataLoader(
             dataset,
@@ -102,67 +99,29 @@ def evaluate(
         total_tokens = 0
         total_examples = 0
 
-        inner = (
-            trainer.moshi_vis.module
-            if hasattr(trainer.moshi_vis, "module")
-            else trainer.moshi_vis
-        )
         device = trainer.ctx.device
-        # Trainer's protected attribute -- accessed because we deliberately
-        # share its mixed-precision config here.
+        # Share the trainer's autocast dtype so eval and train measure
+        # losses in the same precision (no accidental float32 advantage).
         dtype = trainer._dtype  # pylint: disable=protected-access
 
         for batch_idx, batch in enumerate(dataloader):
             if max_batches is not None and batch_idx >= max_batches:
                 break
-            input_ids = batch.input_ids.to(device)
-            target_text = batch.target_text.to(device)
-            loss_mask = batch.loss_mask.to(device)
-            cross_attention_src = (
-                batch.cross_attention_src.to(device)
-                if batch.cross_attention_src is not None
-                else None
-            )
-            sum_condition, fuser_cross, streaming_sum_per_step = (
-                trainer._build_conditioning(  # pylint: disable=protected-access
-                    batch.condition_attributes,
-                    device,
-                    inner,
-                    text_input_ids=input_ids[:, 0],
-                )
-            )
-            ca_src = cross_attention_src
-            if ca_src is None and fuser_cross is not None:
-                ca_src = fuser_cross.to(device)
-
+            batch = batch.to(device)
             with torch.autocast(
                 device_type=device.type,
                 dtype=dtype,
                 enabled=dtype != torch.float32,
             ):
-                _, text_logits, _ = inner.forward_text(
-                    input_ids=input_ids,
-                    cross_attention_src=ca_src,
-                    sum_condition=sum_condition.to(device)
-                    if sum_condition is not None
-                    else None,
-                    streaming_sum_condition=streaming_sum_per_step.to(device)
-                    if streaming_sum_per_step is not None
-                    else None,
+                loss = trainer.training_model(
+                    batch,
+                    cfg_dropout=False,
+                    per_step_streaming_sum=trainer.config.per_step_streaming_sum,
                 )
-                text_logits = text_logits.squeeze(1)
-                loss = next_token_ce_loss(
-                    text_logits=text_logits,
-                    target_text_tokens=target_text,
-                    loss_mask=loss_mask,
-                )
-
-            # Token-weight the mean so the final figure is comparable
-            # across batches of unequal moshi-turn length.
-            n_tokens = int(loss_mask.sum().item())
+            n_tokens = int(batch.loss_mask.sum().item())
             total_loss_x_tokens += loss.item() * n_tokens
             total_tokens += n_tokens
-            total_examples += int(loss_mask.shape[0])
+            total_examples += int(batch.loss_mask.shape[0])
 
         avg_loss = (
             total_loss_x_tokens / total_tokens if total_tokens > 0 else float("nan")
@@ -175,8 +134,7 @@ def evaluate(
             examples=total_examples,
         )
     finally:
-        trainer.moshi_vis.train()
-        trainer.image_proj.train()
+        trainer.training_model.train()
 
 
 def log_eval(

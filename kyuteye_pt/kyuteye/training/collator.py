@@ -132,7 +132,7 @@ def make_live_image_encoder(
 
 
 @dataclass
-class CollatedBatch:
+class CollatedBatch:  # noqa: D101
     """One training batch ready for ``MoshiVis.forward_text``.
 
     :param input_ids: ``[B, num_codebooks, T]`` long tensor -- text codebook
@@ -155,6 +155,23 @@ class CollatedBatch:
     loss_mask: torch.Tensor
     cross_attention_src: Optional[torch.Tensor]
     condition_attributes: list[ConditionAttributes] = field(default_factory=list)
+
+    def to(self, device: torch.device) -> "CollatedBatch":
+        """Move tensor fields to ``device``. ``condition_attributes`` are
+        left CPU-side since the conditioner provider handles its own
+        device-placement at ``prepare``-time.
+        """
+        return CollatedBatch(
+            input_ids=self.input_ids.to(device),
+            target_text=self.target_text.to(device),
+            loss_mask=self.loss_mask.to(device),
+            cross_attention_src=(
+                self.cross_attention_src.to(device)
+                if self.cross_attention_src is not None
+                else None
+            ),
+            condition_attributes=self.condition_attributes,
+        )
 
 
 class RagDataCollator:
@@ -275,8 +292,19 @@ class RagDataCollator:
             )
             return torch.zeros(n_audio, seq_len, dtype=torch.long)
         codes = torch.load(path, map_location="cpu", weights_only=True)
+        # Coerce dtype: Mimi (depending on version) sometimes emits
+        # ``torch.int32`` or ``torch.uint16`` codes. ``input_ids``
+        # downstream is ``torch.long``; cast here so the cat downstream
+        # doesn't silently widen + slow + produce shape surprises.
+        if codes.dtype != torch.long:
+            codes = codes.long()
         assert codes.dim() == 2 and codes.shape[0] == n_audio, (
-            f"expected audio codes of shape [{n_audio}, T], got {codes.shape}"
+            f"expected audio codes of shape [{n_audio}, T] (n_audio derived "
+            f"from num_codebooks={self.num_codebooks} - audio_offset={self.audio_offset}); "
+            f"got {tuple(codes.shape)} from {path}. Most likely cause: the "
+            f"Mimi codec used at preprocessing emits a different number of "
+            f"codebooks than the LM expects -- check the preprocessing "
+            f"recipe vs the model config."
         )
         if codes.shape[1] < seq_len:
             pad = torch.zeros(n_audio, seq_len - codes.shape[1], dtype=torch.long)

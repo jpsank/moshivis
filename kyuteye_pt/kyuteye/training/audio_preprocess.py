@@ -233,6 +233,22 @@ class AudioPreprocessor:
                 wav = torch.zeros(
                     int(self.tts.sample_rate * 0.5), dtype=torch.float32
                 )
+            # Guard against TTS returning empty or 1-sample tensors --
+            # both produce a degenerate stream alignment (the two
+            # speakers' timelines need equal sample counts). Substitute
+            # a minimal silence so the rest of the pipeline doesn't
+            # crash on a zero-length cat.
+            min_samples = max(1, int(self.tts.sample_rate * 0.1))
+            if wav.numel() < min_samples:
+                logger.warning(
+                    "[preprocess] example %d turn %r TTS returned %d samples "
+                    "(< %d); padding with silence",
+                    idx,
+                    turn.role,
+                    wav.numel(),
+                    min_samples,
+                )
+                wav = torch.zeros(min_samples, dtype=torch.float32)
             wav = self._resample_if_needed(wav, self.tts.sample_rate)
             max_samples = int(
                 self.config.max_turn_seconds * self.config.mimi_sample_rate
