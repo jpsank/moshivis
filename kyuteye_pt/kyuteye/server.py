@@ -554,7 +554,9 @@ def start_server(
         mimi_weight = kyuteye_config.mimi_codec
     else:
         mimi_weight = hf_hub_download(kyuteye_config.hf_repo, kyuteye_config.mimi_codec)
-    mimi = get_mimi(mimi_weight, device)
+    # moshi 0.2.x inserted a ``mimi_config`` parameter between filename and device,
+    # so we must pass device by keyword to remain compatible with 0.1.0 call sites.
+    mimi = get_mimi(mimi_weight, device=device)
     log("info", "mimi loaded")
 
     if kyuteye_config.hf_repo is None:

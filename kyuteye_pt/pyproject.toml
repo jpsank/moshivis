@@ -18,7 +18,11 @@ requires-python = ">=3.10"
 dependencies = [
     "einops",
     "huggingface_hub",
-    "moshi==0.1.0",
+    # 0.2.13 is the first upstream release that ships ``set_exec_mask`` /
+    # mask-aware ``reset_streaming`` on ``StreamingModule`` (and MimiModel),
+    # which the BatchedServerState in this backend relies on. Earlier 0.2.x
+    # may work but is untested.
+    "moshi>=0.2.13",
     "numpy<2",
     "sentencepiece",
     "torch==2.2.0",

@@ -92,17 +92,88 @@ class StreamingModule(torch.nn.Module):
             self.reset_streaming()
 
     def streaming_forever(self, batch_size: Optional[int] = None) -> None:
-        """Set in permanent streaming state"""
-        del batch_size
+        """Set in permanent streaming state.
+
+        When ``batch_size`` is provided, it is broadcast to all sub-modules via
+        ``_streaming_state['batch_size']`` so per-slot logic (exec_mask,
+        masked reset) can consult it. Modules that pre-allocate KV caches
+        will still do so lazily on first forward, sized from the actual input
+        tensor shape rather than this value.
+        """
         self._set_streaming(True)
+        if batch_size is not None:
 
-    def reset_streaming(self) -> None:
-        """Reset the streaming state."""
+            def _record(_: str, module: StreamingModule) -> None:
+                module._streaming_state["batch_size"] = batch_size  # type: ignore[assignment]
 
-        def _reset(_: str, module: StreamingModule) -> None:
-            module._streaming_state.clear()
+            self._apply_named_streaming(_record)
 
-        self._apply_named_streaming(_reset)
+    def set_exec_mask(self, exec_mask: torch.Tensor) -> None:
+        """Set the per-slot execution mask, propagated to all sub-modules.
+
+        ``exec_mask`` is a ``[batch_size]`` bool tensor: ``True`` for slots
+        whose streaming state should advance this step, ``False`` for slots
+        that should be skipped (idle). Matches the upstream
+        ``moshi.modules.streaming.StreamingModule.set_exec_mask`` semantics
+        and is the foundation for batched inference where users arrive and
+        leave at independent times.
+
+        Individual modules (attention KV cache, the LM gen wrapper) are
+        responsible for honoring the mask -- this method just stores it.
+        Storage is by key ``'exec_mask'`` in ``_streaming_state`` so any
+        layer can read it with ``self.get_streaming_attribute('exec_mask')``.
+        """
+
+        def _set(_: str, module: StreamingModule) -> None:
+            module._streaming_state["exec_mask"] = exec_mask  # type: ignore[assignment]
+
+        self._apply_named_streaming(_set)
+
+    @property
+    def exec_mask(self) -> Optional[torch.Tensor]:
+        """The current ``[batch_size]`` execution mask, or ``None`` if unset."""
+        return self.get_streaming_attribute("exec_mask", None)
+
+    def reset_streaming(self, reset_mask: Optional[torch.Tensor] = None) -> None:
+        """Reset the streaming state.
+
+        :param reset_mask: Optional ``[batch_size]`` bool tensor selecting
+            which slots to reset. ``None`` (default) resets all slots --
+            matching the original single-batch behavior. When provided,
+            modules are expected to scope their reset to the masked slots.
+            The base implementation clears each sub-module's state dict
+            entirely when no mask is given; when a mask is given, it removes
+            only entries that aren't tensors (since per-slot tensor surgery
+            is module-specific).
+        """
+        if reset_mask is None:
+
+            def _reset(_: str, module: StreamingModule) -> None:
+                module._streaming_state.clear()
+
+            self._apply_named_streaming(_reset)
+        else:
+
+            def _reset_masked(_: str, module: StreamingModule) -> None:
+                # Per-slot: subclasses with tensor-valued state are expected to
+                # override their reset behavior. The default safe action is to
+                # clear scalar state and leave tensor state alone (so the
+                # subclass can apply its own per-slot logic).
+                module._streaming_state["reset_mask"] = reset_mask  # type: ignore[assignment]
+                for key in list(module._streaming_state.keys()):
+                    val = module._streaming_state[key]
+                    if not isinstance(val, torch.Tensor):
+                        if key in ("reset_mask", "batch_size", "exec_mask"):
+                            continue
+                        # Non-tensor scalar state (e.g. ``offset`` int) is a
+                        # session-level counter; reset it when *any* slot
+                        # resets, since we can't have a different scalar per
+                        # slot. Multi-batch deployments should store the
+                        # offset as a tensor and override this method.
+                        if reset_mask.any().item():
+                            del module._streaming_state[key]
+
+            self._apply_named_streaming(_reset_masked)
 
     def get_streaming_state(self) -> State:
         """Return the streaming state, including that of sub-modules."""
