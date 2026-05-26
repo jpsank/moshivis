@@ -12,6 +12,24 @@ from kyuteye.conditioners import (
 )
 
 
+def scatter_with_mask_(
+    tensor: torch.Tensor,
+    dim: int,
+    index: torch.Tensor,
+    value: torch.Tensor,
+    mask: torch.Tensor,
+) -> None:
+    """Scatter ``value`` into ``tensor`` at ``index``, skipping masked-off slots.
+
+    Verbatim port of ``moshi-rag/moshi/moshi/models/lm.py::scatter_with_mask_``.
+    Used by :class:`MoshiVisGen` to write per-slot tokens into the delayed-
+    codebook ring buffer when different batch slots are at different offsets.
+    """
+    old_value = tensor.gather(dim, index)
+    value = torch.where(mask, value, old_value)
+    tensor.scatter_(dim, index, value)
+
+
 def _dropped_condition_tensors(condition_tensors: ConditionTensors) -> ConditionTensors:
     """Return a copy of ``condition_tensors`` with all conditions zeroed out.
 
@@ -764,6 +782,66 @@ class MoshiVisGen(StreamingModule):
         with torch.no_grad():
             self.lm_model.forward_text(sequence_emb=self._condition_prepend)
 
+    def reset_streaming(
+        self, reset_mask: Optional[torch.Tensor] = None
+    ) -> None:
+        """Reset streaming state, with optional per-slot masking.
+
+        When ``reset_mask`` is ``None`` (default), clears everything --
+        equivalent to a fresh session for every slot. When ``reset_mask`` is
+        a ``[batch_size]`` bool tensor, only the masked slots are reset:
+
+        * ``offsets`` are zeroed for masked slots only (via ``torch.where``),
+          matching MoshiRAG's ``_LMGenState.reset`` at lm.py:543.
+        * ``cache`` rows for masked slots are set back to ``ungenerated_token_id``.
+        * ``pending_streaming_sum_per_slot`` entries for masked slots are dropped.
+        * ``offset_cpu`` (the global max-offset scalar) is left alone -- it
+          tracks the longest-lived session in the pool, not any one slot.
+
+        This is the per-slot reset path that BatchedServerState needs to
+        support dynamic user join/leave: when slot ``i`` is released, calling
+        ``reset_streaming(reset_mask=[i-th slot True])`` clears that slot's
+        state without disturbing other active sessions. The
+        :class:`MultiheadAttention` KV cache honors the same mask via its
+        own override (see ``kyuteye/modules/attention.py``).
+        """
+        if reset_mask is None:
+            super().reset_streaming(reset_mask=None)
+            return
+
+        # Per-slot reset: surgically clear only the masked slots' state.
+        offsets = self.get_streaming_attribute("offsets", None)
+        if isinstance(offsets, torch.Tensor):
+            reset_mask_dev = reset_mask.to(offsets.device)
+            new_offsets = torch.where(
+                reset_mask_dev, torch.zeros_like(offsets), offsets
+            )
+            self.add_streaming_attribute("offsets", new_offsets)
+
+        cache = self.get_streaming_attribute("cache", None)
+        if isinstance(cache, torch.Tensor):
+            reset_mask_dev = reset_mask.to(cache.device)
+            # Broadcast reset_mask [B] -> [B, 1, 1] to mask whole rows.
+            keep = reset_mask_dev.view(-1, 1, 1)
+            init_val = torch.full_like(cache, self.lm_model.ungenerated_token_id)
+            cache = torch.where(keep, init_val, cache)
+            self.add_streaming_attribute("cache", cache)
+
+        pending_dict = self.get_streaming_attribute(
+            "pending_streaming_sum_per_slot", None
+        )
+        if isinstance(pending_dict, dict):
+            new_dict = {
+                k: v for k, v in pending_dict.items()
+                if k >= reset_mask.numel() or not bool(reset_mask[k].item())
+            }
+            self.add_streaming_attribute(
+                "pending_streaming_sum_per_slot", new_dict
+            )
+
+        # Propagate the mask to sub-modules (the KV cache override reads it).
+        super().reset_streaming(reset_mask=reset_mask)
+
     @torch.no_grad()
     def step(
         self,
@@ -811,79 +889,77 @@ class MoshiVisGen(StreamingModule):
             input_tokens = _cfg_repeat(input_tokens)  # type: ignore[assignment]
             ca_src = _cfg_repeat(ca_src)  # type: ignore[assignment]
         batch_size = input_tokens.shape[0]
+        device = self.lm_model.device
 
         current_input_cache = self.get_streaming_attribute(
             "cache",
             torch.full(
                 (batch_size, self.lm_model.num_codebooks, self.max_delay + 2),
                 self.lm_model.ungenerated_token_id,
-                device=self.lm_model.device,
+                device=device,
                 dtype=torch.long,
             ),
         )
-        current_offset = self.get_streaming_attribute("offset", 0)
+        # ``offsets`` is a per-slot ``[batch_size]`` long tensor (matches
+        # MoshiRAG ``_LMGenState.offsets`` at lm.py:621). Each slot tracks
+        # its own logical step; idle slots' offsets stay frozen.
+        offsets = self.get_streaming_attribute(
+            "offsets",
+            torch.zeros(batch_size, device=device, dtype=torch.long),
+        )
+        # ``offset_cpu`` is the max-offset scalar used for the warmup guard
+        # (mirrors MoshiRAG ``state.offset_cpu`` at lm.py:858).
+        offset_cpu = self.get_streaming_attribute("offset_cpu", 0)
         dcache_len = current_input_cache.shape[2]
+        CT = dcache_len  # alias matching MoshiRAG variable name
 
         # Multi-batch exec mask: when present, idle slots keep their existing
-        # cache values at each write position. The ``current_offset`` itself
-        # is a shared logical step counter -- all slots advance together --
-        # but the per-slot cache rows only mutate for active slots. The cross-
-        # attention KV cache in :class:`MultiheadAttention` honors the same
-        # mask via its own ``set_exec_mask`` path; together this gives proper
-        # per-slot streaming with no cache corruption for idle slots.
+        # cache values at each write position AND their offsets stay frozen.
+        # MoshiRAG asserts the exec_mask at the LM-level; for our CFG case we
+        # mirror to 2B since both branches always step in lockstep.
         exec_mask = self.get_streaming_attribute("exec_mask", None)
         if exec_mask is not None and self._cfg:
-            # Under CFG the internal batch is 2x; mirror the exec_mask for
-            # both pos+null halves so they stay in sync.
             exec_mask = exec_mask.repeat(2)
-        if exec_mask is not None and exec_mask.shape != (batch_size,):
+        if exec_mask is None:
+            exec_mask = torch.ones(batch_size, dtype=torch.bool, device=device)
+        if exec_mask.shape != (batch_size,):
             raise ValueError(
                 f"exec_mask shape {tuple(exec_mask.shape)} must be ({batch_size},)"
             )
 
-        def _masked_write(dest_slice: torch.Tensor, new_value: torch.Tensor) -> None:
-            """In-place cache write that respects exec_mask if set."""
-            if exec_mask is None:
-                dest_slice.copy_(new_value)
-                return
-            # exec_mask: [B] bool. dest_slice: [B, *] of any shape.
-            keep = exec_mask.view(-1, *([1] * (dest_slice.ndim - 1)))
-            dest_slice.copy_(torch.where(keep, new_value, dest_slice))
+        # Write user-supplied input_tokens into the OTHER codebooks at the
+        # delay-adjusted positions for each slot. Mirrors MoshiRAG lm.py:787-791.
+        delays_all = torch.tensor(lm_model.delays, dtype=torch.long, device=device)
+        other_delays = delays_all[lm_model.num_audio_codebooks_out + lm_model.audio_offset :]
+        write_positions = (
+            offsets[:, None, None] + other_delays[None, :, None]
+        ) % CT
+        scatter_with_mask_(
+            current_input_cache[
+                :, lm_model.num_audio_codebooks_out + lm_model.audio_offset :
+            ],
+            -1,
+            write_positions,
+            input_tokens,
+            exec_mask[:, None, None],
+        )
 
-        # write input_tokens (sent from Mimi) in OTHER codebooks
-        for q_other in range(input_tokens.shape[1]):
-            k = lm_model.num_audio_codebooks_out + lm_model.audio_offset + q_other
-            write_position = (current_offset + lm_model.delays[k]) % dcache_len
-            _masked_write(
-                current_input_cache[:, k, write_position : write_position + 1],
-                input_tokens[:, q_other],
-            )
-
-        # Only for the very beginning, we extend the initial token for the acoustic
-        # token that are delayed, and thus have no good value to take.
-        position = current_offset % dcache_len
-        for k, delay in enumerate(lm_model.delays):
-            if current_offset <= delay:
-                # Initial-token broadcast happens once at session start -- it's
-                # safe to always apply (the exec_mask would skip it for idle
-                # slots, but those slots have nothing meaningful in their cache
-                # at this point anyway, so the broadcast is harmless).
-                current_input_cache[:, k, position] = self.initial_token[:, k, 0]
-
-        # Transformer forward
-        # Strip the CFG-doubled portion (input_ ends up [pos_batch, K, 1]; under
-        # CFG we re-derive the null half from input_ below so we can apply
-        # ``cfg_is_masked_until`` / ``cfg_is_no_text`` masking before doubling.
-        if self._cfg:
-            pos_input = current_input_cache[:user_batch_size, :, position : position + 1]
-        else:
-            pos_input = current_input_cache[:, :, position : position + 1]
-        input_ = pos_input
+        # Build the current step's transformer input by gathering at each
+        # slot's offset. Mirrors MoshiRAG lm.py:793-797.
+        is_init = (
+            offsets[:, None, None] <= delays_all[None, :, None]
+        )
+        # Also feed init tokens to non-executing slots so the forward doesn't
+        # crash on stale cache contents (matches MoshiRAG lm.py:794).
+        is_init = is_init | ~exec_mask[:, None, None]
+        positions = (offsets % CT)[:, None, None].expand_as(is_init)
+        input_ = current_input_cache.gather(dim=2, index=positions)
+        input_ = torch.where(is_init, self.initial_token, input_)
 
         if self.check:
             # Check that we are not feeding in any value that is not generated yet.
             assert not (input_ == lm_model.ungenerated_token_id).any(), (
-                current_offset,
+                offsets,
                 input_,
             )
             assert (
@@ -891,37 +967,34 @@ class MoshiVisGen(StreamingModule):
             ).all(), input_
             assert (input_[:, :1] <= lm_model.text_card).all()
 
-        # Build the CFG-doubled input with optional masking on the null branch.
-        # Mirrors ``moshi-rag/moshi/moshi/models/lm.py`` lines 805-816.
+        # Under CFG we wrote both pos and null halves of the cache identically
+        # above (offsets are equal across halves). Now optionally apply the
+        # null-branch masking from cfg_is_masked_until / cfg_is_no_text before
+        # the transformer forward. Mirrors MoshiRAG lm.py:805-816.
         if self._cfg:
             zero_tok = torch.full(
                 (1,),
                 self.lm_model.zero_token_id,
                 dtype=torch.long,
-                device=input_.device,
+                device=device,
             )
-            # is_init: positions that are still in the warmup / delay window
-            # (where the cache holds an init token rather than a real one).
-            is_init = current_offset <= torch.tensor(
-                lm_model.delays, dtype=torch.long, device=input_.device
-            ).view(1, -1, 1)
             if self._cfg_is_masked_until is not None:
                 limit = (
-                    torch.tensor(lm_model.delays, dtype=torch.long, device=input_.device).view(1, -1, 1)
+                    delays_all[None, :, None]
                     + self._cfg_is_masked_until.view(1, -1, 1)
                 )
-                is_zeroed = current_offset <= limit
+                is_zeroed = offsets[:, None, None] <= limit
                 masked = torch.where(is_zeroed & ~is_init, zero_tok, input_)
-                input_doubled = torch.cat([input_, masked], dim=0)
-            else:
-                input_doubled = input_.repeat(2, 1, 1)
+                # The pos half (first user_batch_size rows) keeps the real input;
+                # the null half (second user_batch_size rows) gets the masked one.
+                pos_half = input_[:user_batch_size]
+                null_half = masked[user_batch_size:]
+                input_ = torch.cat([pos_half, null_half], dim=0)
             if self.cfg_is_no_text:
-                # Force null branch's text token to zero whenever it isn't an init slot.
-                null_text = input_doubled[user_batch_size:, :1]
-                input_doubled[user_batch_size:, :1] = torch.where(
-                    ~is_init[:, :1], zero_tok, null_text
+                null_text = input_[user_batch_size:, :1]
+                input_[user_batch_size:, :1] = torch.where(
+                    ~is_init[user_batch_size:, :1], zero_tok, null_text
                 )
-            input_ = input_doubled
 
         streaming_sum = self.apply_pending_streaming_sum_condition(
             batch_size=user_batch_size
@@ -967,52 +1040,63 @@ class MoshiVisGen(StreamingModule):
         if self.on_audio_hook is not None:
             self.on_audio_hook(audio_tokens)
 
-        # Write generated tokens
-        current_offset += 1
-        position = current_offset % dcache_len
-        # Broadcast user-batch tokens to internal-batch cache (under CFG the
-        # cache has B=2 user-batch slots; the same generated token goes to
-        # both pos+null branches since the cache holds the actual generation).
+        # Advance per-slot offsets only for active slots, matching MoshiRAG
+        # lm.py:857. The user-facing offset_cpu scalar tracks the global
+        # max-offset for the warmup guard below.
+        offsets = torch.where(exec_mask, offsets + 1, offsets)
+        offset_cpu += 1
+
+        # Write sampled tokens back into the cache at each slot's new position.
+        # Under CFG, replicate the sampled token to both halves (they hold
+        # identical history; CFG only affects what the model attends to via
+        # the masked input above, not what we store).
         if self._cfg:
             text_token_for_cache = text_token.repeat(2)
             audio_tokens_for_cache = audio_tokens.repeat(2, 1)
         else:
             text_token_for_cache = text_token
             audio_tokens_for_cache = audio_tokens
-        _masked_write(
-            current_input_cache[:, 0, position],
-            text_token_for_cache,
+        write_positions = (offsets % CT)[:, None, None]
+        scatter_with_mask_(
+            current_input_cache[:, :1],
+            -1,
+            write_positions,
+            text_token_for_cache[:, None, None],
+            exec_mask[:, None, None],
         )
-        _masked_write(
+        scatter_with_mask_(
             current_input_cache[
                 :,
                 lm_model.audio_offset : lm_model.num_audio_codebooks_out
                 + lm_model.audio_offset,
-                position,
             ],
-            audio_tokens_for_cache,
+            -1,
+            write_positions.expand(batch_size, lm_model.num_audio_codebooks_out, 1),
+            audio_tokens_for_cache[:, :, None],
+            exec_mask[:, None, None],
         )
 
-        # if <= max_delay, we continue partial-generation
-        # until removing all ungenerated tokens. ``support_out_of_sync`` lifts
-        # this guard for multi-slot batched deployments where each slot may
-        # be at a different offset and the caller wants tokens back unconditionally.
-        if not self.support_out_of_sync and current_offset <= self.max_delay:
+        # if offset_cpu <= max_delay we're still in the warmup window where
+        # the model needs more steps before the delayed codebooks have valid
+        # data. ``support_out_of_sync`` lifts this guard so the caller always
+        # gets an output back (mirrors MoshiRAG lm.py:871).
+        if not self.support_out_of_sync and offset_cpu <= self.max_delay:
             self.add_streaming_attribute("cache", current_input_cache)
-            self.add_streaming_attribute("offset", current_offset)
+            self.add_streaming_attribute("offsets", offsets)
+            self.add_streaming_attribute("offset_cpu", offset_cpu)
             return None, 0.0
 
-        # otherwise, retrieve tokens with the correct delay
+        # Retrieve tokens with the correct delay, per slot. Mirrors
+        # MoshiRAG lm.py:874-879.
         gen_delays_cuda = self.delays_cuda[
             : lm_model.num_audio_codebooks_out + lm_model.audio_offset
         ]
         index = (
-            ((current_offset - self.max_delay + gen_delays_cuda) % dcache_len)
-            .view(1, -1, 1)
-            .expand(current_input_cache.shape[0], -1, 1)
-        )
+            offsets[:, None, None] - self.max_delay + gen_delays_cuda[None, :, None]
+        ) % CT
         out = current_input_cache.gather(dim=2, index=index)
-        self.add_streaming_attribute("offset", current_offset)
+        self.add_streaming_attribute("offsets", offsets)
+        self.add_streaming_attribute("offset_cpu", offset_cpu)
         self.add_streaming_attribute("cache", current_input_cache)
         # Under CFG, the cache holds both pos and null branches; the caller
         # only cares about the positive branch's generated tokens.
