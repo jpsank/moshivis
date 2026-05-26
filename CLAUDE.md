@@ -103,6 +103,12 @@ Faithful port of MoshiRAG's `ConditionProvider` / `ConditionFuser` / `LUTConditi
 
 All of this is opt-in: enable via the new `rag:` section in `kyuteye_pt/configs/moshika-vis.yaml`. With `--omni-injection-mode=streaming_sum`, retrieved text is sent to an external ARC encoder service (`POST /embed` -> safetensors `[1, T, dim]`) and the response tensor is pushed into the LM's streaming-sum queue. Without a fine-tune, the conditioner weights are random — the path runs but the model won't ground on the reference. See `kyuteye_pt/kyuteye/omni/README.md` for the YAML schema.
 
+CFG (`cfg_coef != 1.0`) and exec_mask-aware multi-batch inference are also wired in: `MoshiVisGen` accepts `cfg_coef`, runs internally at doubled batch with pos+null condition stacks, interpolates text + per-codebook logits before sampling. `kyuteye_pt/kyuteye/batched.py:BatchedServerState` (`--batch-size > 1`) serves up to N concurrent WebSocket sessions in parallel; idle slots are exec_mask-suppressed so their KV cache and streaming-sum queue stay intact. Limitation: a new session can only join when the pool is fully empty (per-slot reset isn't implemented; needs per-slot `end_offset` in KVCache).
+
+### `ssvd/rag_augment.py` — combined RAG+vision training-data generator
+
+Standalone script (lives next to the existing SSVD pipeline) that emits JSONL training examples for a combined MoshiVis+RAG fine-tune. Two modes: `augment_visual` takes an SSVD-generated visual dialogue and uses an LLM to insert `<ret>` markers + synthesize reference documents; `generate_text` produces pure text-only RAG conversations from a seed-topics file. Sketch quality — no dedup / quality filters / human curation. Requires an OpenAI-compatible LLM endpoint (`LLM_BASE_URL`).
+
 ## Conventions
 
 - Use `uv run` (not `pip` / `python`) for the Python backends — both have committed `uv.lock` files and CI uses `--locked`.
