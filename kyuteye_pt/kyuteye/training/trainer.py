@@ -325,8 +325,73 @@ class Trainer:
             epoch += 1
 
     # ------------------------------------------------------------------ forward
+    def _build_conditioning(
+        self,
+        condition_attributes: list,
+        device: torch.device,
+        inner_model: "MoshiVis",
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Build ``sum_condition`` for the LM's full-sequence training forward.
+
+        Calls the model's ``condition_provider`` to encode the
+        :class:`ConditionAttributes` list, then the ``fuser`` to route the
+        results into the per-method slots. For training we collapse
+        ``streaming_sum`` (which assumes ``seq_len=1`` per step at inference)
+        into ``sum_condition`` by mean-pooling the reference embeddings
+        over their sequence dimension; this gives the LM a single
+        broadcast-applicable conditioning vector that exercises the ARC
+        encoder's gradient path. Trade-off vs MoshiRAG's training is
+        documented in ``training/README.md``.
+
+        Returns ``(sum_condition, cross_condition_from_fuser)`` -- the
+        latter is the fuser's ``cross`` output if any, which the caller
+        merges with the image cross-attention KV (or rejects if both are
+        set, matching the loader's collision check).
+        """
+        if (
+            inner_model.condition_provider is None
+            or inner_model.fuser is None
+            or not condition_attributes
+        ):
+            return None, None
+
+        prepared = inner_model.condition_provider.prepare(condition_attributes)
+        condition_tensors = inner_model.condition_provider(prepared)
+
+        sum_cond = inner_model.fuser.get_sum(condition_tensors)
+        streaming_sum = inner_model.fuser.get_streaming_sum(condition_tensors)
+        cross_cond = inner_model.fuser.get_cross(condition_tensors)
+
+        # Collapse streaming_sum [B, T_ref, dim] → [B, 1, dim] by mean
+        # pooling so it broadcasts over the LM's full training sequence
+        # exactly like sum_condition does. This is a deliberate training-
+        # time simplification of MoshiRAG's per-step semantics; the ARC
+        # encoder still gets gradient signal but the per-step temporal
+        # alignment is lost. Re-enable per-step at inference time -- the
+        # streaming_sum queue in ``MoshiVisGen`` is unchanged.
+        if streaming_sum is not None and streaming_sum.shape[1] > 0:
+            streaming_sum_pooled = streaming_sum.mean(dim=1, keepdim=True)
+            if sum_cond is None:
+                sum_cond = streaming_sum_pooled
+            else:
+                sum_cond = sum_cond + streaming_sum_pooled.to(sum_cond)
+
+        return sum_cond, cross_cond
+
     def _forward_one_microbatch(self, batch: CollatedBatch) -> torch.Tensor:
-        """Forward one micro-batch and return the (unscaled) loss."""
+        """Forward one micro-batch and return the (unscaled) loss.
+
+        Builds per-batch ``sum_condition`` via the condition provider
+        and fuser (collapsing ``streaming_sum`` into ``sum`` for
+        training; see :meth:`_build_conditioning`). Applies CFG
+        conditioner dropout when ``cfg_dropout_p > 0`` -- with that
+        probability, the entire batch's ConditionAttributes are
+        replaced with their dropped (all-attributes-nulled) version
+        before being passed through the provider/fuser. The model
+        therefore learns both ``p(x | condition)`` and ``p(x | null)``
+        distributions, which is what makes inference-time CFG sampling
+        produce meaningful interpolations.
+        """
         device = self.ctx.device
         input_ids = batch.input_ids.to(device)
         target_text = batch.target_text.to(device)
@@ -337,15 +402,20 @@ class Trainer:
             else None
         )
 
-        # CFG conditioner dropout: with probability cfg_dropout_p, replace
-        # this batch's ConditionAttributes with their nullified version.
-        # The actual ConditionTensor → fuser → forward_text wiring needs
-        # the trainer to call the conditioner provider; for now we leave
-        # ``sum_condition`` / ``streaming_sum_condition`` as None and let
-        # the model's static condition slots (set up at MoshiVisGen init)
-        # carry the conditioning. Trainers that actually use per-example
-        # conditioning should override this method.
-        del batch  # everything we need is unpacked above
+        # CFG dropout: replace the entire batch's ConditionAttributes with
+        # their nullified version with probability ``cfg_dropout_p``. The
+        # gating is per-batch (not per-example) because the provider's
+        # batch handling is collated -- mixing pos+null in one batch
+        # would require splitting the forward, which loses parallelism.
+        # Per-example mixing can be achieved by simply running two
+        # smaller batches in alternation, which the dataloader does
+        # naturally over training steps.
+        condition_attrs = batch.condition_attributes
+        if (
+            self.config.cfg_dropout_p > 0
+            and torch.rand(()).item() < self.config.cfg_dropout_p
+        ):
+            condition_attrs = dropout_all_conditions(condition_attrs)
 
         # Inner model under DDP wrapper: forward_text is on the underlying
         # MoshiVis, not the DDP wrapper directly. ``.module`` accesses it.
@@ -355,6 +425,19 @@ class Trainer:
             else self.moshi_vis
         )
 
+        sum_condition, fuser_cross = self._build_conditioning(
+            condition_attrs, device, inner
+        )
+
+        # Resolve the cross-attention source: prefer the explicit image
+        # KV (vision path) over the fuser's ``cross`` output. The loader
+        # rejects the collision at config-load time when vision XA is
+        # also enabled, so by the time we get here the two paths are
+        # mutually exclusive in practice.
+        ca_src: Optional[torch.Tensor] = cross_attention_src
+        if ca_src is None and fuser_cross is not None:
+            ca_src = fuser_cross.to(device)
+
         with torch.autocast(
             device_type=device.type,
             dtype=self._dtype,
@@ -362,7 +445,8 @@ class Trainer:
         ):
             transformer_out, text_logits, _gate = inner.forward_text(
                 input_ids=input_ids,
-                cross_attention_src=cross_attention_src,
+                cross_attention_src=ca_src,
+                sum_condition=sum_condition.to(device) if sum_condition is not None else None,
             )
             # text_logits comes out as [B, K_text=1, T, card]. Squeeze K_text.
             text_logits = text_logits.squeeze(1)

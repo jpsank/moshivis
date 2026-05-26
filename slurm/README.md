@@ -101,18 +101,61 @@ unchanged.
   meaningful about audio. Useful only for confirming the pipeline
   works on your cluster before investing in audio preprocessing.
 
-## Audio preprocessing -- still a gap
+## `preprocess_audio.sbatch`
 
-The training data from `ssvd/rag_augment.py` is text-only. Before a
-useful fine-tune you need to:
+One-shot audio preprocessing job. Synthesizes TTS audio for every turn
+in the training JSONL, encodes through Mimi, writes per-example
+`.pt` files in `$AUDIO_CODES_DIR`. Single-GPU job (the Mimi codec is
+small and the TTS is the bottleneck).
 
-1. Synthesize TTS audio for every turn (Coqui XTTS, Bark, internal
-   Kyutai TTS, etc. -- choice is yours).
-2. Encode each turn's audio through Mimi (`moshi.models.loaders.get_mimi`
-   then `mimi.encode(pcm)`).
-3. Save the result as `.pt` files keyed by example index in
-   `$AUDIO_CODES_DIR/{idx}.pt`. Shape: `[n_audio_codebooks, T]` long.
+Submit:
 
-A preprocessing script for this isn't shipped because the TTS choice is
-deployment-specific; the collator's audio-loading contract is small
-enough to write your own in ~100 lines.
+```bash
+MIMI_WEIGHT=/path/to/tokenizer-...safetensors \
+TTS_BACKEND=coqui_xtts \
+TTS_USER_REF=/path/to/user_voice.wav \
+TTS_MOSHI_REF=/path/to/moshi_voice.wav \
+sbatch slurm/preprocess_audio.sbatch
+```
+
+For initial pipeline validation without a real TTS dep:
+
+```bash
+MIMI_WEIGHT=/path/to/tokenizer.safetensors \
+TTS_BACKEND=silence \
+sbatch slurm/preprocess_audio.sbatch
+```
+
+The `silence` backend writes zero-PCM audio (Mimi-encodes to the
+"silence" code at every timestep). The training pipeline runs
+end-to-end but the model isn't learning audio behavior -- useful only
+for confirming the trainer runs on your cluster before investing in
+TTS setup.
+
+### Parallelizing across the dataset (array jobs)
+
+For large datasets, run preprocessing as a Slurm array job split into
+shards:
+
+```bash
+SHARDS=8 TOTAL_EXAMPLES=50000 \
+MIMI_WEIGHT=/path/to/mimi.safetensors \
+TTS_BACKEND=silence \
+sbatch --array=0-7 slurm/preprocess_audio.sbatch
+```
+
+Each task processes `TOTAL_EXAMPLES / SHARDS` consecutive examples.
+`--skip-existing` (set in the script by default) means re-running an
+array re-processes only the missing shards.
+
+### Pluggable TTS
+
+Two TTS backends ship in `kyuteye.training.audio_preprocess`:
+
+* `SilenceTTS` -- zero PCM proportional to text length. Validation only.
+* `CoquiXTTS` -- driver for the `TTS` PyPI package (Coqui XTTS v2). Needs `pip install TTS` plus reference audio clips for each speaker.
+
+For other TTS engines (Bark, StyleTTS2, internal models): subclass
+`BaseTTS` in your own module and call `AudioPreprocessor.process_example`
+directly. The interface is one method (`synthesize(text, speaker) -> Tensor`)
+and the docs in `audio_preprocess.py` document the contract.

@@ -195,23 +195,84 @@ hasn't been exercised on real GPU + weights from this environment.
 First run on your cluster will surface integration bugs. Plan for one
 shakeout day before scheduling the long-running fine-tune.
 
+## Audio preprocessing
+
+`ssvd/rag_augment.py` emits text-only JSONL; the trainer's collator
+expects per-example Mimi-encoded audio codes in `--audio-codes-dir`.
+The audio preprocessing pipeline lives in
+`kyuteye.training.audio_preprocess`:
+
+* `BaseTTS` -- abstract TTS interface. One method:
+  `synthesize(text, speaker) -> Tensor`.
+* `SilenceTTS` -- placeholder that returns zero PCM. Use for end-to-end
+  pipeline validation before committing to a TTS dependency.
+* `CoquiXTTS` -- driver for Coqui's `TTS` package (XTTS v2). Lazy
+  import; install with `pip install TTS` and supply reference audio
+  for each speaker voice.
+* `AudioPreprocessor.process_example(example, idx)` -- synthesizes the
+  user + moshi tracks for one dialogue, encodes through Mimi, saves
+  `{idx}.pt` with shape `[n_audio_codebooks, T]` matching the trainer
+  collator's expected layout.
+
+CLI entry point:
+
+```bash
+python -m kyuteye.training.audio_preprocess \
+    --input data/augmented.jsonl \
+    --output-dir data/audio_codes \
+    --mimi-weight $MIMI_WEIGHT \
+    --tts coqui_xtts \
+    --tts-user-ref refs/user.wav \
+    --tts-moshi-ref refs/moshi.wav
+```
+
+Slurm template: `slurm/preprocess_audio.sbatch`. Supports array-job
+sharding for parallelizing across large datasets.
+
+For other TTS engines (Bark, StyleTTS2, your in-house model): subclass
+`BaseTTS` in your own module, instantiate `AudioPreprocessor` directly.
+The interface is one method; pluggability was the explicit goal.
+
+## CFG dropout during training
+
+The trainer's `_forward_one_microbatch` now applies CFG conditioner
+dropout when `--cfg-dropout-p > 0`: with that probability the entire
+batch's ConditionAttributes are replaced with their null version via
+`dropout_all_conditions`, and the resulting condition tensors flow
+through the provider/fuser into `sum_condition` for the forward pass.
+The model learns both `p(x | condition)` and `p(x | null)`
+distributions; inference-time `cfg_coef > 1.0` then interpolates
+between them.
+
+Per-batch (not per-example) dropout is a deliberate simplification --
+mixing pos+null in a single batch would require splitting the forward
+which loses parallelism. Per-example mixing is achieved naturally by
+the random dropout decision varying across training steps.
+
+### Streaming-sum vs sum-condition trade-off at training
+
+The conditioner fuser routes `reference_with_time` to `streaming_sum`
+in MoshiRAG's stock config. At inference, the streaming-sum queue is
+consumed one row per step (`MoshiVisGen.apply_pending_streaming_sum_condition`).
+At training the LM's forward runs over the full sequence, where the
+`streaming_sum_condition` parameter asserts `seq_len == 1`. The
+trainer's `_build_conditioning` resolves this by mean-pooling the
+streaming-sum tensor over its sequence dimension into a single
+broadcastable conditioning vector that's added to `sum_condition`.
+This is a *training-time simplification*: the ARC encoder still gets
+gradient signal, but the per-step temporal alignment that
+streaming-sum gives at inference is lost during training. For a
+faithful per-step streaming-sum training path, override
+`_build_conditioning` to align the reference embeddings with the LM's
+sequence length on a per-position basis -- not shipped because it
+needs design choices that depend on your data layout (how do you
+align a variable-length reference with the dialogue timeline?).
+
 ## What still has to be written
 
-* **Audio preprocessing pipeline**. `ssvd/rag_augment.py` emits
-  text-only JSONL; the trainer expects per-example audio codes in
-  `--audio-codes-dir`. A preprocessing script that synthesizes TTS
-  audio for each turn and Mimi-encodes it isn't shipped because the
-  TTS choice is deployment-specific. The collator's audio contract is
-  small (one `.pt` file per example, shape `[n_audio_codebooks, T]`).
-  You can run a one-shot job on a TTS of your choice; document the
-  recipe in your fork.
-* **CFG dropout during training**. The trainer hardcodes the
-  `cfg_dropout_p` argument but doesn't yet wire it through to the
-  forward pass -- the static condition slots set up at
-  `MoshiVisGen.__init__` carry the conditioning. For a true CFG
-  training loop, override `Trainer._forward_one_microbatch` to apply
-  `dropout_all_conditions` per micro-batch and re-prepare the
-  ConditionTensors before the forward. ~30 lines of override code.
 * **WandB / TensorBoard logging**. The trainer logs to Python logging
   every `--log-every` steps. Wrap the log call in a hook if you want
   experiment tracking.
+* **Per-step streaming-sum training** (see trade-off above).
+* **Evaluation harness** -- pick a held-out split and your preferred
+  speech metrics; we don't ship an evaluator.
