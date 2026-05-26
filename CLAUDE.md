@@ -97,6 +97,12 @@ Added on top of MoshiVis as an opt-in pipeline; off unless `--omni-plugin=my.mod
 
 Important caveat: MoshiVis was trained with **image patches** as the cross-attention source. Stuffing text embeddings through the same pathway is out-of-distribution — orchestration and detection all work, but the model won't reliably ground answers in the retrieved text via the XA pathway. Retrieved/tool results are always echoed back to the UI regardless, which is the reliable surface. See `kyuteye_pt/kyuteye/omni/README.md` for the full design.
 
+### `kyuteye_pt/kyuteye/conditioners/` — MoshiRAG conditioner machinery
+
+Faithful port of MoshiRAG's `ConditionProvider` / `ConditionFuser` / `LUTConditioner` / `TensorConditioner` / `learnt_padding` so a combined MoshiVis+RAG fine-tune's state-dict layout slots into MoshiVis without surgery. `MoshiVis.forward_text` accepts `sum_condition` / `streaming_sum_condition` / `sequence_emb`; `MoshiVisGen` adds `update_streaming_sum_tensor`, `apply_pending_streaming_sum_condition`, and `prime()` (applies prepend at session start, mirroring MoshiRAG's `_reset_callback`).
+
+All of this is opt-in: enable via the new `rag:` section in `kyuteye_pt/configs/moshika-vis.yaml`. With `--omni-injection-mode=streaming_sum`, retrieved text is sent to an external ARC encoder service (`POST /embed` -> safetensors `[1, T, dim]`) and the response tensor is pushed into the LM's streaming-sum queue. Without a fine-tune, the conditioner weights are random — the path runs but the model won't ground on the reference. See `kyuteye_pt/kyuteye/omni/README.md` for the YAML schema.
+
 ## Conventions
 
 - Use `uv run` (not `pip` / `python`) for the Python backends — both have committed `uv.lock` files and CI uses `--locked`.

@@ -4,6 +4,11 @@ from functools import partial
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import torch
+from kyuteye.conditioners import (
+    ConditionFuser,
+    ConditionProvider,
+    ConditionTensors,
+)
 from kyuteye.config.kyuteye_config import KyuteyeConfig
 from kyuteye.models.helium import Helium
 from kyuteye.modules.streaming_utils import StreamingModule
@@ -45,12 +50,34 @@ class MoshiVis(StreamingModule):
         text_card: int = 32000,
         text_context: Optional[int] = None,
         padding_token_id: int = 3,
+        condition_provider: Optional[ConditionProvider] = None,
+        fuser: Optional[ConditionFuser] = None,
+        rag_token_id: Optional[int] = None,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
         **kwargs: Any,
     ) -> None:
-        """Initialize a MoshiVis model"""
+        """Initialize a MoshiVis model.
+
+        :param condition_provider: Optional MoshiRAG-style conditioner registry.
+            When provided, the model's state-dict layout matches MoshiRAG so
+            a combined fine-tune can be loaded without surgery.
+        :param fuser: Optional :class:`ConditionFuser`. Routes named conditions
+            into the ``sum`` / ``prepend`` / ``cross`` / ``streaming_sum`` slots
+            of :meth:`forward_text`. Must be paired with ``condition_provider``.
+        :param rag_token_id: Optional text-vocab id that signals retrieval. When
+            the model emits this token, the server's Omni pipeline fires the
+            configured retriever. ``None`` (default) disables the token path;
+            the substring trigger (``<ret>``) still works.
+        """
         super().__init__()
+        self.condition_provider = condition_provider
+        self.fuser = fuser
+        self.rag_token_id = rag_token_id
+        if (condition_provider is None) != (fuser is None):
+            raise ValueError(
+                "condition_provider and fuser must be set together (both or neither)"
+            )
         # Set parameter for generation/preprocessing
         self.text_card = text_card
         self.audio_card = audio_card
@@ -181,12 +208,15 @@ class MoshiVis(StreamingModule):
 
     def forward_text(
         self,
-        input_ids: torch.Tensor,
+        input_ids: Optional[torch.Tensor] = None,
         cross_attention_src: Optional[
             Tuple[torch.Tensor, torch.Tensor] | torch.Tensor
         ] = None,
         cross_attention_mask: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        sum_condition: Optional[torch.Tensor] = None,
+        streaming_sum_condition: Optional[torch.Tensor] = None,
+        sequence_emb: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, float]:
         """Forward pass for Moshi
 
@@ -198,20 +228,41 @@ class MoshiVis(StreamingModule):
             might be of different sizes and therefore padded.
         :param attention_mask: Optional attention mask on input_ids (e.g. used at
             generation for batched inference with left padding)
-        :return: A tuple containing the
-          * text logits (None if `text_or_audio` is audio)
-          * audio logits (None if `text_or_audio` is text)
+        :param sum_condition: Optional ``(batch, 1, llm_dim)`` tensor added to
+            input embeddings once at every step (MoshiRAG ``sum`` fuser path).
+        :param streaming_sum_condition: Optional ``(batch, 1, llm_dim)`` tensor
+            added to input embeddings per generation step (MoshiRAG
+            ``streaming_sum`` fuser path -- the one used for asynchronous
+            retrieval injection). Must be passed only with ``seq_len==1``.
+        :param sequence_emb: Optional pre-computed input embeddings of shape
+            ``(batch, T, llm_dim)``. When provided, ``input_ids`` is ignored and
+            the embeddings are fed straight to the transformer. Used to apply
+            the ``prepend`` condition at session start.
+        :return: ``(transformer_out, text_logits, gate_weight)``.
         """
-        # Embed tokens
-        inputs_embeds = torch.zeros((), device=input_ids.device)
-        if self.audio_offset > 0:
-            inputs_embeds = self.llm.text_emb(input_ids[:, 0, :])
+        # Embed tokens (or accept caller-provided embeddings for prepend path).
+        if sequence_emb is not None:
+            assert input_ids is None, "pass either input_ids or sequence_emb, not both"
+            inputs_embeds = sequence_emb
+        else:
+            assert input_ids is not None, "input_ids is required when sequence_emb is None"
+            inputs_embeds = torch.zeros((), device=input_ids.device)
+            if self.audio_offset > 0:
+                inputs_embeds = self.llm.text_emb(input_ids[:, 0, :])
+            for cb_index in range(self.num_audio_codebooks_in):
+                update = self.audio_emb[cb_index](
+                    input_ids[:, cb_index + self.audio_offset, :]
+                )
+                inputs_embeds += update
 
-        for cb_index in range(self.num_audio_codebooks_in):
-            update = self.audio_emb[cb_index](
-                input_ids[:, cb_index + self.audio_offset, :]
-            )
-            inputs_embeds += update
+        if sum_condition is not None:
+            inputs_embeds = inputs_embeds + sum_condition.to(inputs_embeds)
+
+        if streaming_sum_condition is not None:
+            assert (
+                streaming_sum_condition.shape[1] == inputs_embeds.shape[1] == 1
+            ), "streaming_sum_condition is only supported in streaming (seq_len=1) mode"
+            inputs_embeds = inputs_embeds + streaming_sum_condition.to(inputs_embeds)
 
         # Pass through Helium
         transformer_out, gate_weight = self.llm(
@@ -307,6 +358,8 @@ class MoshiVisGen(StreamingModule):
         top_k: int = 250,
         top_k_text: int = 25,
         check: bool = False,
+        condition_tensors: Optional[ConditionTensors] = None,
+        force_streaming_sum: bool = False,
     ):
         assert not moshi_vis.training, "generation shouldn't be used in training mode."
         super().__init__()
@@ -325,6 +378,43 @@ class MoshiVisGen(StreamingModule):
             moshi_vis.delays, device=self.lm_model.device, dtype=torch.long
         )
         self.initial_token = self.lm_model.get_initial_token()
+        self.condition_tensors = condition_tensors
+        self.force_streaming_sum = force_streaming_sum
+
+        # Pre-compute the static (per-session) condition slots from
+        # ``condition_tensors``. The MoshiRAG ``LMGen`` does the equivalent
+        # inside ``_init_streaming_state`` per batch; MoshiVis is single-batch
+        # so we resolve them once at construction time.
+        self._condition_sum: Optional[torch.Tensor] = None
+        self._condition_cross: Optional[torch.Tensor] = None
+        self._condition_prepend: Optional[torch.Tensor] = None
+        self._condition_streaming_sum_init: Optional[torch.Tensor] = None
+        if condition_tensors is not None and self.lm_model.fuser is not None:
+            fuser = self.lm_model.fuser
+            self._condition_sum = fuser.get_sum(condition_tensors)
+            self._condition_cross = fuser.get_cross(condition_tensors)
+            self._condition_prepend = fuser.get_prepend(condition_tensors)
+            self._condition_streaming_sum_init = fuser.get_streaming_sum(condition_tensors)
+            target_dtype = self.lm_model.llm.text_emb.weight.dtype
+            for name in (
+                "_condition_sum",
+                "_condition_cross",
+                "_condition_prepend",
+                "_condition_streaming_sum_init",
+            ):
+                t = getattr(self, name)
+                if t is not None:
+                    setattr(self, name, t.to(dtype=target_dtype))
+        if self.force_streaming_sum and self._condition_streaming_sum_init is None:
+            # Allocate a zero ``[1, 1, dim]`` slot so the streaming_sum path
+            # is always exercised -- matches MoshiRAG's ``force_streaming_sum``.
+            self._condition_streaming_sum_init = torch.zeros(
+                1,
+                1,
+                self.lm_model.llm.dim,
+                device=self.lm_model.device,
+                dtype=self.lm_model.llm.text_emb.weight.dtype,
+            )
 
     def update_gen_kwargs(
         self,
@@ -356,25 +446,35 @@ class MoshiVisGen(StreamingModule):
         moshi_weight: Optional[Dict[str, Any]] = None,
         device: str | torch.device = "cpu",
         dtype: torch.dtype = torch.bfloat16,
+        condition_tensors: Optional[ConditionTensors] = None,
         **gen_kwargs: Any,
     ) -> "MoshiVisGen":
-        """Instantiate model from a config
+        """Instantiate model from a config.
 
-        :param base config:
-        :param moshi_weight
+        :param condition_tensors: Optional pre-computed MoshiRAG-style condition
+            tensors (one entry per conditioner). When ``None``, the conditioning
+            paths stay inactive. See :func:`kyuteye.models.loaders.get_moshi_vis`
+            for how these are produced from a fine-tune's conditioner registry.
         """
         moshivis = MoshiVis(**kyuteye_config.moshi_constructor_kwargs, dtype=dtype)
         if moshi_weight is not None:
             missing_keys, _ = moshivis.load_state_dict(moshi_weight, strict=False)
-            # cross-attention MHSA is shared across layers
+            # Cross-attention MHSA is shared across layers (only layers.0 holds it).
+            # Conditioner / fuser weights only exist in MoshiRAG-finetuned checkpoints,
+            # so they are also expected-missing when loading a vanilla MoshiVis ckpt.
             missing_keys = [
                 k
                 for k in missing_keys
                 if ("cross_attention.mha" not in k or "layers.0" in k)
+                and not k.startswith("condition_provider.")
             ]
-            assert len(missing_keys) == 0
+            assert len(missing_keys) == 0, missing_keys
 
-        return MoshiVisGen(moshi_vis=moshivis.eval().to(device), **gen_kwargs)
+        return MoshiVisGen(
+            moshi_vis=moshivis.eval().to(device),
+            condition_tensors=condition_tensors,
+            **gen_kwargs,
+        )
 
     @torch.no_grad()
     def precompte_ca_kv(
@@ -395,13 +495,90 @@ class MoshiVisGen(StreamingModule):
         )
         return k, v
 
+    def update_streaming_sum_tensor(self, tensor: Optional[torch.Tensor]) -> None:
+        """Set the pending streaming-sum queue for this session.
+
+        Single-slot equivalent of MoshiRAG's
+        ``LMGen.update_streaming_sum_tensors``. Call this when a new reference
+        becomes available (e.g. once the ARC encoder responds for an Omni RAG
+        retrieval).
+
+        :param tensor: Either ``None`` (clear the queue), a ``[T, dim]`` tensor,
+            or a ``[1, T, dim]`` tensor (leading batch dim is squeezed). ``T``
+            is the number of streaming-sum rows; one row is consumed per
+            :meth:`step` call via :meth:`apply_pending_streaming_sum_condition`.
+        """
+        if tensor is None:
+            self.add_streaming_attribute("pending_streaming_sum", None)
+            return
+        if tensor.dim() == 3 and tensor.shape[0] == 1:
+            tensor = tensor[0]
+        assert tensor.dim() == 2, f"expected [T, dim] tensor, got {tuple(tensor.shape)}"
+        assert tensor.shape[-1] == self.model_dim, (
+            f"streaming_sum dim {tensor.shape[-1]} != model dim {self.model_dim}"
+        )
+        tensor = tensor.to(
+            device=self.lm_model.device,
+            dtype=self.lm_model.llm.text_emb.weight.dtype,
+        )
+        self.add_streaming_attribute("pending_streaming_sum", tensor)
+
+    def apply_pending_streaming_sum_condition(self) -> Optional[torch.Tensor]:
+        """Consume one row of the pending queue into the active condition slot.
+
+        Returns the ``[1, 1, dim]`` tensor that should be passed to
+        :meth:`MoshiVis.forward_text` as ``streaming_sum_condition`` for the
+        upcoming step, or ``None`` if neither a pending queue nor a
+        ``force_streaming_sum`` zero slot is active.
+
+        Mirrors MoshiRAG's ``LMGen.apply_pending_streaming_sum_condition``.
+        Always called from :meth:`step`; the server does not need to call it
+        directly.
+        """
+        pending = self.get_streaming_attribute("pending_streaming_sum", None)
+        active = self._condition_streaming_sum_init  # zeros when force_streaming_sum
+
+        if pending is not None and pending.shape[0] > 0:
+            row = pending[0].view(1, 1, -1)
+            if pending.shape[0] > 1:
+                self.add_streaming_attribute("pending_streaming_sum", pending[1:])
+            else:
+                self.add_streaming_attribute("pending_streaming_sum", None)
+            return row
+
+        return active  # may be None when no force_streaming_sum and queue empty
+
+    def prime(self) -> None:
+        """Apply the (static) prepend condition once at session start.
+
+        MoshiRAG runs this from its ``_reset_callback``. We expose it as an
+        explicit method so the server can call it after
+        :meth:`reset_streaming`. No-op when there is no prepend condition.
+        """
+        if self._condition_prepend is None or self._condition_prepend.shape[1] == 0:
+            return
+        with torch.no_grad():
+            self.lm_model.forward_text(sequence_emb=self._condition_prepend)
+
     @torch.no_grad()
     def step(
         self,
         input_tokens: torch.Tensor,
         ca_src: Optional[Tuple[torch.Tensor, torch.Tensor] | torch.Tensor] = None,
     ) -> Tuple[torch.Tensor | None, float]:
-        """One step of generation"""
+        """One step of generation.
+
+        Automatically pulls per-step conditioning from the configured slots:
+
+        * ``sum_condition`` from the static ``_condition_sum``
+        * ``streaming_sum_condition`` from
+          :meth:`apply_pending_streaming_sum_condition` (queue or static zeros)
+
+        ``ca_src`` is the explicit cross-attention input -- for MoshiVis this is
+        the image KV (and optionally Omni text KV concatenated on top); we
+        keep it as a parameter rather than routing through ``_condition_cross``
+        because the vision path predates the conditioner machinery.
+        """
         state = self._streaming_state
         if state is None:
             raise RuntimeError(
@@ -458,8 +635,12 @@ class MoshiVisGen(StreamingModule):
             ).all(), input_
             assert (input_[:, :1] <= lm_model.text_card).all()
 
+        streaming_sum = self.apply_pending_streaming_sum_condition()
         transformer_out, text_logits, gate_weight = self.lm_model.forward_text(
-            input_, cross_attention_src=ca_src
+            input_,
+            cross_attention_src=ca_src,
+            sum_condition=self._condition_sum,
+            streaming_sum_condition=streaming_sum,
         )
 
         # Sample text tokens

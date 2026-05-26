@@ -131,6 +131,76 @@ class MoshiConfig:
 
 
 @dataclass(frozen=False)
+class RagConfig:
+    """MoshiRAG-style conditioning machinery, opt-in.
+
+    Mirrors the conditioner / fuser configuration shipped with
+    kyutai-labs/moshi-rag (see ``moshi-rag/moshi/configs/moshirag.json``)
+    so a combined MoshiVis+RAG fine-tune can be hosted by this backend.
+    All fields default to "off"; existing MoshiVis checkpoints are
+    unaffected.
+    """
+
+    # When False (default), no conditioner machinery is instantiated and the
+    # model behaves exactly like the published MoshiVis. Set to True (and
+    # populate the fields below) when loading a MoshiVis+RAG fine-tune.
+    enabled: bool = False
+
+    # The id (in the SentencePiece text vocab) of the learned retrieval-trigger
+    # token. When set, the server treats this token id as a hard RAG trigger
+    # in addition to the substring trigger configured via Omni.
+    rag_token_id: Optional[int] = None
+
+    # If True, allocates a zero ``streaming_sum`` slot at session start so the
+    # streaming_sum forward path is always active (mirrors MoshiRAG's
+    # ``force_streaming_sum=True``).
+    force_streaming_sum: bool = True
+
+    # Conditioner registry. Maps attribute name -> {type, ...kwargs}.
+    # Supported types: ``lut`` (LUTConditioner), ``tensor`` (TensorConditioner).
+    # Example matching MoshiRAG defaults:
+    #   conditioners:
+    #     first_speaker:
+    #       type: lut
+    #       n_bins: 2
+    #       tokenizer: noop
+    #       possible_values: [SPEAKER_MAIN, SPEAKER_OTHER]
+    #       dim: 16
+    #     reference_with_time:
+    #       type: tensor
+    #       dim: 4096
+    conditioners: Dict[str, Dict[str, Any]] = None  # type: ignore[assignment]
+
+    # Fuser routing. Maps method (``sum`` / ``prepend`` / ``cross`` /
+    # ``streaming_sum``) -> list of conditioner names.
+    # Example matching MoshiRAG defaults:
+    #   fuse2cond:
+    #     prepend: [first_speaker]
+    #     streaming_sum: [reference_with_time]
+    fuse2cond: Dict[str, Any] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.conditioners is None:
+            self.conditioners = {}
+        if self.fuse2cond is None:
+            self.fuse2cond = {}
+        if self.enabled and not self.conditioners:
+            raise ValueError(
+                "RagConfig.enabled is True but no conditioners are configured"
+            )
+
+    @staticmethod
+    def help(field_name: str) -> str:
+        if field_name == "enabled":
+            return "Whether to instantiate the MoshiRAG-style conditioning machinery"
+        if field_name == "rag_token_id":
+            return "SentencePiece token id that triggers RAG when emitted"
+        if field_name == "force_streaming_sum":
+            return "Always allocate the streaming_sum slot, even before any reference is set"
+        return ""
+
+
+@dataclass(frozen=False)
 class FusionConfig:
     """Configures how we integrate the image information in MoshiVis"""
 

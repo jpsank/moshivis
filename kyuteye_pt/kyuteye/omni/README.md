@@ -96,21 +96,67 @@ server \
 | `--omni-tool-start` | `[TOOL:` | Opening marker. |
 | `--omni-tool-end` | `]` | Closing marker. |
 
-## What is "experimental" about XA injection?
+## Injection modes
 
-MoshiVis was trained with **image patch** embeddings as the cross-attention
-source. We piggyback on the same code path to inject text by tokenizing
-the retrieved string with SentencePiece, looking up the LLM's text
-embedding table, and projecting the result through
-`MoshiVisGen.precompte_ca_kv`. The K/V tensors are concatenated with the
-image K/V along the sequence dimension.
+`--omni-injection-mode` controls how a retrieved reference reaches the model:
 
-Mechanically this works -- the model attends to a longer K/V cache --
-but the semantics of attending to text via the image-trained pathway are
-unsurprising-to-uninspiring. Even when XA injection is off the retrieved
-text is always streamed back to the user via the WebSocket text channel,
-so a human operator can see the reference. Disable with
-`--no-omni-xa-injection` to compare A/B.
+* **`xa` (default, experimental)** — re-encode the reference via SentencePiece +
+  Helium's text-embedding table, project through `MoshiVisGen.precompte_ca_kv`,
+  and concatenate K/V with the image K/V. MoshiVis was trained with image
+  patches as the cross-attention source, so attending to text via that pathway
+  is out of distribution. Mechanically works, semantically weak. Set
+  `--no-omni-xa-injection` to skip the concat and only surface the reference
+  to the UI.
+* **`streaming_sum`** — the MoshiRAG-faithful path. Requires:
+  1. A model config with `rag.enabled: true` and conditioners declared (see
+     "Combined MoshiVis+RAG model" below).
+  2. A running ARC encoder service (HTTP `POST /embed` -> safetensors
+     `[1, T, dim]`). Point at it with `--omni-arc-encoder-url=...` or the
+     `REFERENCE_ENCODER_URL` env var.
+  The retrieved text is forwarded to the ARC encoder, the response tensor is
+  pushed into the LM's streaming-sum queue via
+  `MoshiVisGen.update_streaming_sum_tensor`, and one row per step is added
+  to the LM's input embeddings.
+* **`off`** — the reference is surfaced to the UI as `[REF: ...]` but the
+  model is not touched. Useful as a control.
+
+Regardless of mode, the retrieved/tool text is always sent to the WebSocket
+text channel so a human operator can see what the retriever produced.
+
+## Combined MoshiVis+RAG model
+
+The PyTorch backend now hosts MoshiRAG's full conditioner machinery
+(`ConditionProvider`, `ConditionFuser`, `LUTConditioner`, `TensorConditioner`,
+`learnt_padding`) under `kyuteye/conditioners/`, and `MoshiVis.forward_text`
+accepts `sum_condition` / `streaming_sum_condition` / `sequence_emb` so a
+combined fine-tune slots in without code changes. To enable, add a `rag:`
+section to the YAML config:
+
+```yaml
+rag:
+  enabled: true
+  rag_token_id: 31999          # learned <ret> token id in the SP vocab
+  force_streaming_sum: true    # allocate a zero slot even before any reference
+  conditioners:
+    first_speaker:
+      type: lut
+      n_bins: 2
+      tokenizer: noop
+      possible_values: [SPEAKER_MAIN, SPEAKER_OTHER]
+      dim: 16
+    reference_with_time:
+      type: tensor
+      dim: 4096                # ARC encoder output width
+  fuse2cond:
+    prepend: [first_speaker]
+    streaming_sum: [reference_with_time]
+```
+
+Loading vanilla MoshiVis checkpoints against a `rag.enabled: true` config is
+allowed -- the conditioner weights initialize randomly and the streaming-sum
+forward path runs with random offsets. The expected workflow is to fine-tune
+on combined visual + RAG data and ship that checkpoint; see kyutai-labs/moshi-rag
+for the ARC encoder build and training data format.
 
 ## Layout
 

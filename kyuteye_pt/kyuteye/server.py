@@ -33,6 +33,7 @@ from kyuteye.omni import (
     default_registry,
     get_retriever,
 )
+from kyuteye.omni.arc_encoder_client import encode_reference_async, get_arc_encoder_url
 from moshi.models.loaders import get_mimi
 from torchvision.io import ImageReadMode, decode_image
 
@@ -112,6 +113,8 @@ class ServerState:
         omni_xa_injection: bool = True,
         omni_tool_start: str = "[TOOL:",
         omni_tool_end: str = "]",
+        omni_arc_encoder_url: Optional[str] = None,
+        omni_injection_mode: Literal["xa", "streaming_sum", "off"] = "xa",
     ):
         self.mimi = mimi
         self.text_tokenizer = text_tokenizer
@@ -135,6 +138,8 @@ class ServerState:
         self.omni_xa_injection = omni_xa_injection
         self.omni_tool_start = omni_tool_start
         self.omni_tool_end = omni_tool_end
+        self.omni_arc_encoder_url = omni_arc_encoder_url
+        self.omni_injection_mode: Literal["xa", "streaming_sum", "off"] = omni_injection_mode
 
         self.mimi.streaming_forever(1)
         self.moshi_vis.streaming_forever(1)
@@ -169,6 +174,7 @@ class ServerState:
         # not bleed between simultaneous conversations.
         monitor = TextStreamMonitor(
             rag_trigger=self.omni_rag_trigger,
+            rag_token_id=getattr(self.moshi_vis.lm_model, "rag_token_id", None),
             tool_start=self.omni_tool_start,
             tool_end=self.omni_tool_end,
         )
@@ -177,7 +183,11 @@ class ServerState:
             tokenizer=self.text_tokenizer,
             device=self.device,
             dtype=self.dtype,
-            enabled=self.omni_enabled and self.omni_xa_injection,
+            enabled=(
+                self.omni_enabled
+                and self.omni_xa_injection
+                and self.omni_injection_mode == "xa"
+            ),
         )
         retriever = get_retriever() if self.omni_enabled else None
         rag_manager: OmniRAGManager | None = None
@@ -199,12 +209,35 @@ class ServerState:
             await ws.send_bytes(msg)
 
         async def on_reference_text(reference: str) -> None:
-            if reference:
-                log("info", f"[Omni] retrieved reference: {reference[:120]!r}")
-                await send_omni_text(f" [REF: {reference}] ", marker=10)
-                context_injector.add_text(reference, role="reference")
-            else:
+            if not reference:
                 await send_omni_text(" [RET_FAILED] ", marker=10)
+                return
+            log("info", f"[Omni] retrieved reference: {reference[:120]!r}")
+            await send_omni_text(f" [REF: {reference}] ", marker=10)
+
+            if self.omni_injection_mode == "streaming_sum":
+                # Route through the remote ARC encoder, then push the resulting
+                # ``[1, T, dim]`` tensor into the LM's streaming_sum queue.
+                # Requires the model to have been built with rag.enabled=True
+                # and for the ARC encoder service to be running.
+                url = self.omni_arc_encoder_url or get_arc_encoder_url()
+                if not url:
+                    log(
+                        "warning",
+                        "[Omni] streaming_sum mode but no ARC encoder URL configured; "
+                        "skipping injection",
+                    )
+                    return
+                try:
+                    tensor = await encode_reference_async(reference, encoder_url=url)
+                except Exception as e:
+                    log("error", f"[Omni] ARC encoder call failed: {e}")
+                    return
+                self.moshi_vis.update_streaming_sum_tensor(tensor)
+            elif self.omni_injection_mode == "xa":
+                context_injector.add_text(reference, role="reference")
+            # injection_mode == "off": the [REF: ...] surface in the UI is the
+            # only place the reference lands; the model itself sees nothing.
 
         async def dispatch_tool(event: Any) -> None:
             if event.tool is None:
@@ -308,7 +341,7 @@ class ServerState:
                             )
 
                             if self.omni_enabled:
-                                emit, events = monitor.consume(_text, text_token)
+                                emit, events = monitor.consume(_text, token_id=text_token)
                                 for event in events:
                                     log("info", f"[Omni] event: {event.kind} {event.raw!r}")
                                     if event.kind == "rag" and rag_manager is not None:
@@ -380,6 +413,7 @@ class ServerState:
             opus_reader = sphn.OpusStreamReader(self.mimi.sample_rate)  # type: ignore
             self.mimi.reset_streaming()
             self.moshi_vis.reset_streaming()
+            self.moshi_vis.prime()  # apply MoshiRAG-style prepend, if any
             monitor.reset()
             if rag_manager is not None:
                 rag_manager.reset()
@@ -445,6 +479,8 @@ def start_server(
     omni_xa_injection: bool = True,
     omni_tool_start: str = "[TOOL:",
     omni_tool_end: str = "]",
+    omni_arc_encoder_url: Optional[str] = None,
+    omni_injection_mode: Literal["xa", "streaming_sum", "off"] = "xa",
 ) -> None:
     """Start server
 
@@ -468,10 +504,24 @@ def start_server(
     :param omni_rag_max_tokens: Max tokens to request from the retrieval LLM.
     :param omni_rag_wait_steps: Number of model steps to wait before firing
         retrieval (lets the model speak some filler while we look things up).
-    :param omni_xa_injection: When True, retrieved/tool text is re-encoded
-        and concatenated with the image cross-attention KV. Experimental.
+    :param omni_xa_injection: When True (and ``omni_injection_mode='xa'``),
+        retrieved/tool text is re-encoded and concatenated with the image
+        cross-attention KV. Experimental -- the MoshiVis weights weren't
+        trained to attend to text via that pathway.
     :param omni_tool_start: Opening marker for ``[TOOL: name(args)]`` patterns.
     :param omni_tool_end: Closing marker.
+    :param omni_arc_encoder_url: URL of an external MoshiRAG-compatible ARC
+        encoder service (``POST /embed`` -> safetensors ``[1, T, dim]``). Used
+        only when ``omni_injection_mode='streaming_sum'``. Defaults to the
+        ``REFERENCE_ENCODER_URL`` env var.
+    :param omni_injection_mode: How to surface retrieved text to the model.
+        * ``xa``: re-encode via SentencePiece + concat with image XA KV
+          (experimental, see above).
+        * ``streaming_sum``: route through the remote ARC encoder and push
+          into the LM's streaming_sum queue (requires ``rag.enabled=True``
+          in the model config and a running ARC encoder service; this is the
+          MoshiRAG-faithful path).
+        * ``off``: only surface to the UI, do not touch the model.
     """
     assert kyuteye_config_path is not None
     root_dir = Path(__file__).parents[2]
@@ -557,6 +607,8 @@ def start_server(
         omni_xa_injection=omni_xa_injection,
         omni_tool_start=omni_tool_start,
         omni_tool_end=omni_tool_end,
+        omni_arc_encoder_url=omni_arc_encoder_url,
+        omni_injection_mode=omni_injection_mode,
     )
     log("info", "warming up the model")
     state.warmup()

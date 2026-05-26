@@ -37,6 +37,7 @@ dependencies = [
 [project.optional-dependencies]
 omni = [
     "openai >= 1.0",  # default LLM-based retriever in kyuteye.omni
+    "httpx >= 0.27",  # ARC encoder client (streaming_sum injection mode)
 ]
 
 [project.scripts]

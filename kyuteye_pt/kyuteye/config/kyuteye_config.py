@@ -15,6 +15,7 @@ from kyuteye.config.subconfigs import (
     ImageEncoderConfig,
     LMConfig,
     MoshiConfig,
+    RagConfig,
 )
 from kyuteye.utils.dist_utils import print_main
 from kyuteye.utils.logging_utils import flatten_nested_dict
@@ -26,9 +27,14 @@ class KyuteyeConfig:
     fuse: FusionConfig
     image: ImageEncoderConfig
     lm: LMConfig
+    rag: RagConfig
 
     def __init__(self, **kwargs: Any):
         self._fields_to_sub: Dict[str, str] = {}
+
+        # Pull the optional ``rag`` subdict out before flattening so its
+        # nested ``conditioners`` / ``fuse2cond`` maps stay intact.
+        rag_kwargs = kwargs.pop("rag", None) or {}
 
         # Define all modular subconfigs defined in subconfigs.py
         backup_kwargs = deepcopy(kwargs)
@@ -38,7 +44,14 @@ class KyuteyeConfig:
             ("image", ImageEncoderConfig),
             ("lm", LMConfig),
             ("moshi", MoshiConfig),
+            ("rag", RagConfig),
         ]:
+            if name == "rag":
+                # ``rag`` carries nested dicts (``conditioners``, ``fuse2cond``)
+                # that should not be flattened into the top-level kwargs.
+                setattr(self, name, constructor(**rag_kwargs))
+                self._subnames.append(name)
+                continue
             keys = {f.name for f in fields(constructor)}
             setattr(
                 self,
@@ -182,12 +195,19 @@ def __load_yaml__(path: Path | str) -> Dict:
     with open(path, "r") as stream:
         config = yaml.safe_load(stream)
 
+    # The optional ``rag`` subdict has nested dicts (conditioners, fuse2cond)
+    # that must survive intact; the other top-level groups are flattened by
+    # KyuteyeConfig.
+    rag_section = config.pop("rag", None)
+
     # KyuteyeConfig works with flattened dict as inputs
     config = flatten_nested_dict(config)
 
     # Yaml parse sequences sa list -> tuples
     config = {k: tuple(v) if isinstance(v, list) else v for k, v in config.items()}
 
+    if rag_section is not None:
+        config["rag"] = rag_section
     return config
 
 
