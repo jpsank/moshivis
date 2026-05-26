@@ -10,12 +10,14 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 
 from kyuteye.conditioners import (
+    ArcEncoderConditioner,
     BaseConditioner,
     ConditionAttributes,
     ConditionFuser,
     ConditionProvider,
     ConditionTensors,
     LUTConditioner,
+    MultiArcEncoderConditioner,
     TensorConditioner,
 )
 from kyuteye.config.kyuteye_config import KyuteyeConfig
@@ -28,6 +30,8 @@ logger = logging.getLogger(__name__)
 _CONDITIONER_CLASSES: Dict[str, type[BaseConditioner]] = {
     "lut": LUTConditioner,
     "tensor": TensorConditioner,
+    "arc": ArcEncoderConditioner,
+    "multi_arc": MultiArcEncoderConditioner,
 }
 
 
@@ -198,6 +202,24 @@ def get_moshi_vis(
         assert len(missing_keys) == 0, missing_keys
 
     moshivis = moshivis.eval().to(device).to(dtype)
+
+    # ARC encoder conditioners can carry their own ``hf_repo`` and load
+    # pretrained weights AFTER the main checkpoint -- mirrors MoshiRAG's
+    # ``loaders.get_moshi_lm`` post-load hook. Skipping ``load_weights``
+    # leaves the encoder at random init, which is the "train-from-scratch"
+    # path (or for callers who train the encoder separately).
+    if rag_enabled and moshivis.condition_provider is not None:
+        for name, mod in moshivis.condition_provider.conditioners.items():
+            if isinstance(mod, ArcEncoderConditioner):
+                try:
+                    mod.load_weights()
+                except Exception as e:  # pragma: no cover - best-effort, ARC is opt-in
+                    logger.warning(
+                        "[RAG] ARC conditioner %r load_weights() failed: %s -- "
+                        "encoder will run at random init",
+                        name,
+                        e,
+                    )
 
     condition_tensors: Optional[ConditionTensors] = None
     if rag_enabled:

@@ -30,14 +30,30 @@ from kyuteye.conditioners.base import (
 from kyuteye.conditioners.tensors import TensorConditioner
 from kyuteye.conditioners.text import LUTConditioner, NoopTokenizer
 
+# ARC encoder is in its own module because it pulls xformers (optional dep).
+# Module import is fail-safe -- only constructing the conditioner triggers
+# the xformers check (see arc_encoder.py:_require_xformers).
+from kyuteye.conditioners.arc_encoder import (  # noqa: E402
+    ArcEncoderConditioner,
+    ArcEncoderTokenizer,
+    ArcEncoderTransformer,
+    EmbProjector,
+    MultiArcEncoderConditioner,
+)
+
 __all__ = [
+    "ArcEncoderConditioner",
+    "ArcEncoderTokenizer",
+    "ArcEncoderTransformer",
     "BaseConditioner",
     "ConditionAttributes",
     "ConditionFuser",
     "ConditionProvider",
     "ConditionTensors",
     "ConditionType",
+    "EmbProjector",
     "LUTConditioner",
+    "MultiArcEncoderConditioner",
     "NoopTokenizer",
     "TensorCondition",
     "TensorConditioner",

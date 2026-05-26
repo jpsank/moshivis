@@ -158,29 +158,104 @@ forward path runs with random offsets. The expected workflow is to fine-tune
 on combined visual + RAG data and ship that checkpoint; see kyutai-labs/moshi-rag
 for the ARC encoder build and training data format.
 
+### ARC encoder modes -- remote vs in-process
+
+Reference text → conditioning tensors goes through an **ARC encoder**, the
+trainable bridge MoshiRAG uses to feed reference embeddings into the LM's
+`streaming_sum` slot. Two ways to host it:
+
+* **Remote (default, recommended for serving)**. The ARC encoder runs in
+  a separate HTTP service (e.g. MoshiRAG's `Dockerfile.arc_encoder`). The
+  client at `kyuteye/omni/arc_encoder_client.py` POSTs the reference text
+  to `{URL}/embed`, receives a safetensors-encoded `[1, T, dim]` tensor,
+  and pushes it into the LM's per-slot streaming-sum queue. Activate with
+  `--omni-injection-mode=streaming_sum` and `--omni-arc-encoder-url=...`
+  (or the `REFERENCE_ENCODER_URL` env var). No GPU memory for the ARC
+  encoder on the Moshi server; you can place it on a different machine.
+
+* **In-process (recommended for training, or single-machine inference)**.
+  The full ARC encoder is now ported into `kyuteye/conditioners/arc_encoder.py`
+  -- a faithful port of `moshi-rag/moshi/moshi/conditioners/arc_encoder.py`.
+  Configure it as a conditioner in the YAML:
+
+  ```yaml
+  rag:
+    enabled: true
+    rag_token_id: 31999
+    force_streaming_sum: true
+    conditioners:
+      first_speaker:
+        type: lut
+        n_bins: 2
+        tokenizer: noop
+        possible_values: [SPEAKER_MAIN, SPEAKER_OTHER]
+        dim: 16
+      reference_with_time:
+        type: arc          # was: type: tensor
+        tokenizer_name: meta-llama/Llama-3.2-3B-Instruct
+        embedder_params:
+          compress_rates: [-4]
+        bridge_module:
+          in_dim: 3072
+          out_dim: 4096          # Moshi LM hidden dim
+          hidden_dim: 4096
+        # Optional: load pretrained MoshiRAG ARC weights.
+        # hf_repo: kyutai/moshika-rag-pytorch-bf16
+        output_dim: 4096
+    fuse2cond:
+      prepend: [first_speaker]
+      streaming_sum: [reference_with_time]
+  ```
+
+  Install: `pip install '.[arc]'` (adds xformers). xformers is required;
+  the conditioner constructor raises a clear error if it's missing.
+
+  At inference, the loader calls `ArcEncoderConditioner.load_weights()`
+  if `hf_repo` is set; otherwise the encoder runs at random init, which
+  is the **train-from-scratch** path. For training, set
+  `finetune: true` on the conditioner config -- the encoder weights are
+  then included in the trainable parameter set.
+
+### Combined MoshiVis + RAG training (from scratch)
+
+The architecture in this branch lets you train a combined fine-tune end-
+to-end without copying anything back from kyutai-labs/moshi-rag:
+
+1. **Architecture**: enable the `rag:` section above. The ARC encoder is
+   in-process under the `reference_with_time` conditioner. The conditioner
+   module ships with `finetune=True` support so its parameters are
+   trainable. ConditionFuser routes ARC output to `streaming_sum` and the
+   speaker LUT to `prepend`. The MoshiVis vision pathway stays on
+   `cross_attention_src`, unchanged.
+
+2. **Data**: use `ssvd/rag_augment.py` to generate JSONL training examples
+   (visual+RAG via `augment_visual`, text-only RAG via `generate_text`).
+
+3. **Conditioner dropout (for CFG training)**: import
+   `dropout_all_conditions` from `kyuteye.conditioners` and apply it
+   randomly to your sample batches during training. At inference, set
+   `cfg_coef > 1.0` to amplify the conditioning signal.
+
+4. **Training loop**: not in this repo (MoshiVis is inference-only).
+   But all the pieces -- ARC encoder, fuser, dropout utilities,
+   `force_streaming_sum`, CFG -- are present and trainable. A future
+   training repo on top of this branch should be able to do
+   `model.train()` + gradient backprop without further architectural
+   work.
+
 ### Features intentionally **not** ported from MoshiRAG
 
-The merge targets a single-batch streaming inference backend. The following
-MoshiRAG features were skipped on purpose; flag them if your fine-tune
-requires any of them:
+The merge targets a streaming inference backend. The following MoshiRAG
+features were skipped on purpose; flag them if your use case needs any:
 
-* **Classifier-free guidance (`cfg_coef != 1.0`)** -- MoshiRAG doubles the
-  batch with positive/negative conditions and interpolates logits per step.
-  MoshiVis pt has no CFG hook. A CFG-trained fine-tune will still load, but
-  inference runs as `cfg_coef=1` (the conditional branch only).
-* **`support_out_of_sync`** -- MoshiRAG's per-slot async exec-mask handling.
-  Single-batch backend doesn't need it.
-* **Depformer streaming_sum / per-codebook conditioning** -- the audio
-  depformer in this backend ignores conditioning; only the main transformer
-  consumes the streaming-sum row.
-* **`on_text_hook`, `on_audio_hook`, `on_text_logits_hook`** -- MoshiRAG's
-  per-step callbacks. The Omni `TextStreamMonitor` provides the equivalent
-  observability at a higher level.
-* **The `cross` fuser slot** -- vision owns cross-attention; the loader
-  raises if `rag.fuse2cond` routes anything to ``cross``.
-* **Local `ArcEncoder` module + `T5Conditioner`** -- the remote ARC encoder
-  service covers the runtime path and avoids pulling T5 / xformers into the
-  PyTorch backend.
+* **`T5Conditioner`** -- text encoder using HuggingFace T5 + spacy. The
+  ARC encoder is the modern path; T5 is the legacy alternative. Pull in
+  if you need to load a T5-conditioned checkpoint.
+* **`WhiteSpaceTokenizer` with spacy NLP processing** -- only the
+  whitespace-split + hash version is ported; full lemmatization/stopword
+  removal needs spacy.
+* **Training-loop helpers outside conditioner dropout** -- DataLoaders,
+  loss schedules, optimizer setup, etc. Inference-only repo charter.
 
 ## Layout
 

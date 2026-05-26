@@ -43,6 +43,11 @@ omni = [
     "openai >= 1.0",  # default LLM-based retriever in kyuteye.omni
     "httpx >= 0.27",  # ARC encoder client (streaming_sum injection mode)
 ]
+arc = [
+    # In-process ARC encoder (kyuteye.conditioners.arc_encoder).
+    # xformers needs a CUDA + PyTorch combo it likes; pin loosely.
+    "xformers >= 0.0.27",
+]
 
 [project.scripts]
 server = "kyuteye.server:main"
