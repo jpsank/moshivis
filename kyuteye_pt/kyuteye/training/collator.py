@@ -72,10 +72,15 @@ def make_live_image_encoder(
 ) -> "Any":
     """Build a callable suitable for ``RagDataCollator(image_encode_fn=...)``.
 
-    Closes over the image-encoder model + the model's
-    ``precompte_ca_kv`` projection so each call goes from an image file
-    on disk to a ``[T_img, dim]`` cross-attention KV tensor ready to
-    drop into ``input_ids`` cross-attention.
+    Returns a function that maps an image file path to the raw
+    cross-attention source tensor ``[T_img, dim]`` (image embeddings
+    *before* the model's K/V projection). The trainer's ``forward_text``
+    accepts this format directly and runs the K/V projection internally
+    each step. The ``moshi_vis_gen`` argument is kept in the signature
+    for forward-compat (the precomputed inference path uses
+    ``precompte_ca_kv`` to amortize K/V across many streaming steps,
+    but training does one forward per batch so the amortization isn't
+    worth the format mismatch).
 
     Important: the returned callable runs the encoder inline -- on
     whichever device ``image_proj`` is on. If the image encoder lives
@@ -85,17 +90,20 @@ def make_live_image_encoder(
     accept the slowdown), OR use ``num_workers=0`` so the encoder
     call happens in the main process where the GPU is available.
 
-    Pre-computing to ``precomputed_image_kv_dir`` is the recommended
-    path for any non-toy dataset; this helper exists for completeness
-    and quick prototyping.
+    Pre-computing to ``precomputed_image_kv_dir`` (despite the name,
+    storing *raw embeddings*, not K/V) is the recommended path for any
+    non-toy dataset; this helper exists for completeness and quick
+    prototyping.
 
-    :param moshi_vis_gen: A :class:`MoshiVisGen` (has the
-        ``precompte_ca_kv`` cross-attention KV projection).
+    :param moshi_vis_gen: A :class:`MoshiVisGen`. Held for forward-compat;
+        not used in the current raw-embedding path.
     :param image_proj: A :class:`ImageProjection` -- the image
         backbone + projection from the model loader.
     :param image_size: Resolution the image is resized to before
         encoding. Matches ``image_size`` in the YAML config.
     """
+    del moshi_vis_gen  # Reserved for future K/V-cache pre-projection path.
+
     # Lazy imports to keep this module's load cheap.
     from torchvision.io import ImageReadMode, decode_image  # type: ignore[import-untyped]
 
@@ -121,12 +129,10 @@ def make_live_image_encoder(
             img = img[None, ...]
         with torch.no_grad():
             ca_src = image_proj(img)["cross_attention_src"]
-            k, v = moshi_vis_gen.precompte_ca_kv(ca_src)
-        # Return as (K, V) tuple stacked into a single tensor for the
-        # collator's storage. The trainer/model later splits it back.
-        # ``[2, T_img, dim]`` packs both halves; the collator's image
-        # stacking handles either shape transparently.
-        return torch.stack([k.squeeze(0), v.squeeze(0)], dim=0)
+        # Return raw embedding ``[T_img, dim]``. The collator stacks a
+        # batch of these into ``[B, T_img, dim]`` which ``forward_text``
+        # consumes directly (handles K/V projection per step).
+        return ca_src.squeeze(0)
 
     return encode
 
@@ -196,8 +202,12 @@ class RagDataCollator:
         are relative to. ``None`` means treat ``image_path`` as
         absolute paths.
     :param precomputed_image_kv_dir: When set, look up
-        ``{image_path_stem}.pt`` here for pre-computed cross-attention
-        KV instead of running the image encoder. Fast path.
+        ``{image_path_stem}.pt`` here for a pre-computed *raw image
+        embedding* ``[T_img, dim]`` (saved by some preprocessing pass).
+        Despite the historical name, this is NOT a precomputed K/V tuple
+        -- training feeds the raw embedding to ``forward_text`` which
+        does its own K/V projection. The naming is kept for backward
+        compatibility with earlier docs.
     :param image_encode_fn: Optional callable ``(image_path: str) ->
         Tensor`` that returns the cross-attention KV for that image
         live. Slower than the precomputed path but doesn't require a
