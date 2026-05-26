@@ -134,17 +134,34 @@ class StreamingModule(torch.nn.Module):
         """The current ``[batch_size]`` execution mask, or ``None`` if unset."""
         return self.get_streaming_attribute("exec_mask", None)
 
+    def _reset_streaming_masked(self, reset_mask: torch.Tensor) -> None:
+        """Per-module per-slot reset hook -- override in subclasses.
+
+        The base implementation just stamps the ``reset_mask`` into this
+        module's streaming state so downstream code can read it. Subclasses
+        with per-slot tensor state (KV caches, offset tensors, queues)
+        override this method to do the actual surgery: zero only the
+        masked slots' entries, leave others alone.
+
+        Critically, this method must NOT iterate sub-modules -- the parent
+        ``reset_streaming`` handles the recursion via
+        ``_apply_named_streaming``. Implementing per-slot reset here keeps
+        the dispatch acyclic.
+        """
+        self._streaming_state["reset_mask"] = reset_mask  # type: ignore[assignment]
+
     def reset_streaming(self, reset_mask: Optional[torch.Tensor] = None) -> None:
         """Reset the streaming state.
 
         :param reset_mask: Optional ``[batch_size]`` bool tensor selecting
             which slots to reset. ``None`` (default) resets all slots --
             matching the original single-batch behavior. When provided,
-            modules are expected to scope their reset to the masked slots.
-            The base implementation clears each sub-module's state dict
-            entirely when no mask is given; when a mask is given, it removes
-            only entries that aren't tensors (since per-slot tensor surgery
-            is module-specific).
+            walks every ``StreamingModule`` in the tree and invokes its
+            :meth:`_reset_streaming_masked` hook, so subclass overrides
+            (e.g. ``MultiheadAttention`` clearing its per-slot KV cache,
+            ``MoshiVisGen`` zeroing per-slot offsets) all run on a single
+            top-level ``reset_streaming(reset_mask=...)`` call from the
+            server.
         """
         if reset_mask is None:
 
@@ -152,28 +169,15 @@ class StreamingModule(torch.nn.Module):
                 module._streaming_state.clear()
 
             self._apply_named_streaming(_reset)
-        else:
+            return
 
-            def _reset_masked(_: str, module: StreamingModule) -> None:
-                # Per-slot: subclasses with tensor-valued state are expected to
-                # override their reset behavior. The default safe action is to
-                # clear scalar state and leave tensor state alone (so the
-                # subclass can apply its own per-slot logic).
-                module._streaming_state["reset_mask"] = reset_mask  # type: ignore[assignment]
-                for key in list(module._streaming_state.keys()):
-                    val = module._streaming_state[key]
-                    if not isinstance(val, torch.Tensor):
-                        if key in ("reset_mask", "batch_size", "exec_mask"):
-                            continue
-                        # Non-tensor scalar state (e.g. ``offset`` int) is a
-                        # session-level counter; reset it when *any* slot
-                        # resets, since we can't have a different scalar per
-                        # slot. Multi-batch deployments should store the
-                        # offset as a tensor and override this method.
-                        if reset_mask.any().item():
-                            del module._streaming_state[key]
+        # Masked path: call each module's per-slot reset hook. The hook is
+        # responsible for whatever surgery makes sense for that module's
+        # tensor state. Acyclic by construction (hooks don't recurse).
+        def _call_hook(_: str, module: StreamingModule) -> None:
+            module._reset_streaming_masked(reset_mask)
 
-            self._apply_named_streaming(_reset_masked)
+        self._apply_named_streaming(_call_hook)
 
     def get_streaming_state(self) -> State:
         """Return the streaming state, including that of sub-modules."""

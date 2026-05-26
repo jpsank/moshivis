@@ -315,6 +315,32 @@ class MultiheadAttention(StreamingModule):
             embed_dim, mult * embed_dim, bias=False, **factory_kwargs
         )
 
+    def _reset_streaming_masked(self, reset_mask: torch.Tensor) -> None:
+        """Per-slot reset of the KV cache + streaming offset.
+
+        Closes the chain that ``MoshiVisGen.reset_streaming(reset_mask=...)``
+        starts: ``StreamingModule.reset_streaming`` walks every module and
+        calls this hook; we surgically reset only the masked slots'
+        ``end_offset`` and per-slot ``streaming_offset``, leaving other
+        active sessions untouched.
+        """
+        # KV cache: per-slot reset of end_offset (cache contents stay; future
+        # writes will overwrite the relevant ring positions).
+        kv_cache = self._streaming_state.get("kv_cache")
+        if isinstance(kv_cache, KVCache):
+            kv_cache.reset(reset_mask=reset_mask)
+
+        # Per-slot streaming_offset tensor: zero out masked slots' entries.
+        offset = self._streaming_state.get("offset")
+        if isinstance(offset, torch.Tensor) and offset.dim() >= 1:
+            mask_dev = reset_mask.to(offset.device)
+            self._streaming_state["offset"] = torch.where(
+                mask_dev, torch.zeros_like(offset), offset
+            )
+
+        # Stamp the mask for downstream readers (matches base hook semantics).
+        super()._reset_streaming_masked(reset_mask)
+
     def _complete_kv(
         self, k: torch.Tensor, v: torch.Tensor, initial_kv_cache_size: int = 256
     ) -> Tuple[torch.Tensor, torch.Tensor]:

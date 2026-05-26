@@ -811,65 +811,54 @@ class MoshiVisGen(StreamingModule):
         with torch.no_grad():
             self.lm_model.forward_text(sequence_emb=self._condition_prepend)
 
-    def reset_streaming(
-        self, reset_mask: Optional[torch.Tensor] = None
-    ) -> None:
-        """Reset streaming state, with optional per-slot masking.
+    def _reset_streaming_masked(self, reset_mask: torch.Tensor) -> None:
+        """Per-slot surgery for MoshiVisGen's own streaming state.
 
-        When ``reset_mask`` is ``None`` (default), clears everything --
-        equivalent to a fresh session for every slot. When ``reset_mask`` is
-        a ``[batch_size]`` bool tensor, only the masked slots are reset:
-
-        * ``offsets`` are zeroed for masked slots only (via ``torch.where``),
-          matching MoshiRAG's ``_LMGenState.reset`` at lm.py:543.
-        * ``cache`` rows for masked slots are set back to ``ungenerated_token_id``.
-        * ``pending_streaming_sum_per_slot`` entries for masked slots are dropped.
-        * ``offset_cpu`` (the global max-offset scalar) is left alone -- it
-          tracks the longest-lived session in the pool, not any one slot.
-
-        This is the per-slot reset path that BatchedServerState needs to
-        support dynamic user join/leave: when slot ``i`` is released, calling
-        ``reset_streaming(reset_mask=[i-th slot True])`` clears that slot's
-        state without disturbing other active sessions. The
-        :class:`MultiheadAttention` KV cache honors the same mask via its
-        own override (see ``kyuteye/modules/attention.py``).
+        Called by the base ``reset_streaming(reset_mask=...)`` walk for
+        every ``StreamingModule`` in the tree, so a single top-level call
+        like ``moshi_vis.reset_streaming(reset_mask=one_hot)`` triggers
+        this method here PLUS each ``MultiheadAttention``'s own
+        :meth:`_reset_streaming_masked` (which clears the per-slot KV
+        cache and ``streaming_offset``). The ``offset_cpu`` Python scalar
+        is left alone -- it tracks the longest-lived session in the pool,
+        not any one slot.
         """
-        if reset_mask is None:
-            super().reset_streaming(reset_mask=None)
-            return
-
-        # Per-slot reset: surgically clear only the masked slots' state.
+        # Per-slot offsets ([batch_size] tensor): zero only masked slots.
+        # Matches MoshiRAG's ``_LMGenState.reset`` at lm.py:543.
         offsets = self.get_streaming_attribute("offsets", None)
         if isinstance(offsets, torch.Tensor):
             reset_mask_dev = reset_mask.to(offsets.device)
-            new_offsets = torch.where(
-                reset_mask_dev, torch.zeros_like(offsets), offsets
+            self.add_streaming_attribute(
+                "offsets",
+                torch.where(reset_mask_dev, torch.zeros_like(offsets), offsets),
             )
-            self.add_streaming_attribute("offsets", new_offsets)
 
+        # Delayed-codebook cache: restore the masked rows to ``ungenerated_token_id``.
         cache = self.get_streaming_attribute("cache", None)
         if isinstance(cache, torch.Tensor):
             reset_mask_dev = reset_mask.to(cache.device)
-            # Broadcast reset_mask [B] -> [B, 1, 1] to mask whole rows.
             keep = reset_mask_dev.view(-1, 1, 1)
             init_val = torch.full_like(cache, self.lm_model.ungenerated_token_id)
-            cache = torch.where(keep, init_val, cache)
-            self.add_streaming_attribute("cache", cache)
+            self.add_streaming_attribute(
+                "cache", torch.where(keep, init_val, cache)
+            )
 
+        # Per-slot streaming-sum queue: drop entries for masked slots.
         pending_dict = self.get_streaming_attribute(
             "pending_streaming_sum_per_slot", None
         )
         if isinstance(pending_dict, dict):
             new_dict = {
-                k: v for k, v in pending_dict.items()
+                k: v
+                for k, v in pending_dict.items()
                 if k >= reset_mask.numel() or not bool(reset_mask[k].item())
             }
             self.add_streaming_attribute(
                 "pending_streaming_sum_per_slot", new_dict
             )
 
-        # Propagate the mask to sub-modules (the KV cache override reads it).
-        super().reset_streaming(reset_mask=reset_mask)
+        # Stamp the mask for downstream readers + base hook semantics.
+        super()._reset_streaming_masked(reset_mask)
 
     @torch.no_grad()
     def step(
