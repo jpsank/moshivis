@@ -638,6 +638,7 @@ class MoshiVisGen(StreamingModule):
             "pending_streaming_sum_per_slot", {}
         )
         active = self._condition_streaming_sum_init  # [B_internal, 1, dim] or None
+        exec_mask = self.get_streaming_attribute("exec_mask", None)
 
         # Fast path: no queues anywhere, return the static slot.
         if not pending_dict:
@@ -657,7 +658,9 @@ class MoshiVisGen(StreamingModule):
         else:
             out = torch.zeros(internal_batch, 1, dim, device=device, dtype=dtype)
 
-        # Pop one row per slot that has a queue; update the dict in place.
+        # Pop one row per *active* slot that has a queue; update the dict in
+        # place. Idle slots keep their queue intact -- silent users shouldn't
+        # consume reference context they haven't actually heard.
         new_dict = dict(pending_dict)
         for slot_idx, pending in pending_dict.items():
             if slot_idx >= batch_size:
@@ -666,6 +669,12 @@ class MoshiVisGen(StreamingModule):
                 continue
             if pending.shape[0] == 0:
                 new_dict.pop(slot_idx, None)
+                continue
+            if exec_mask is not None and not bool(exec_mask[slot_idx].item()):
+                # Slot is idle this step: surface the next row to the forward
+                # pass (so the model sees the right offset if it does run for
+                # this slot) but do NOT pop it from the queue.
+                out[slot_idx, 0] = pending[0]
                 continue
             out[slot_idx, 0] = pending[0]
             if pending.shape[0] > 1:
@@ -747,12 +756,39 @@ class MoshiVisGen(StreamingModule):
         current_offset = self.get_streaming_attribute("offset", 0)
         dcache_len = current_input_cache.shape[2]
 
+        # Multi-batch exec mask: when present, idle slots keep their existing
+        # cache values at each write position. The ``current_offset`` itself
+        # is a shared logical step counter -- all slots advance together --
+        # but the per-slot cache rows only mutate for active slots. The cross-
+        # attention KV cache in :class:`MultiheadAttention` honors the same
+        # mask via its own ``set_exec_mask`` path; together this gives proper
+        # per-slot streaming with no cache corruption for idle slots.
+        exec_mask = self.get_streaming_attribute("exec_mask", None)
+        if exec_mask is not None and self._cfg:
+            # Under CFG the internal batch is 2x; mirror the exec_mask for
+            # both pos+null halves so they stay in sync.
+            exec_mask = exec_mask.repeat(2)
+        if exec_mask is not None and exec_mask.shape != (batch_size,):
+            raise ValueError(
+                f"exec_mask shape {tuple(exec_mask.shape)} must be ({batch_size},)"
+            )
+
+        def _masked_write(dest_slice: torch.Tensor, new_value: torch.Tensor) -> None:
+            """In-place cache write that respects exec_mask if set."""
+            if exec_mask is None:
+                dest_slice.copy_(new_value)
+                return
+            # exec_mask: [B] bool. dest_slice: [B, *] of any shape.
+            keep = exec_mask.view(-1, *([1] * (dest_slice.ndim - 1)))
+            dest_slice.copy_(torch.where(keep, new_value, dest_slice))
+
         # write input_tokens (sent from Mimi) in OTHER codebooks
         for q_other in range(input_tokens.shape[1]):
             k = lm_model.num_audio_codebooks_out + lm_model.audio_offset + q_other
             write_position = (current_offset + lm_model.delays[k]) % dcache_len
-            current_input_cache[:, k, write_position : write_position + 1] = (
-                input_tokens[:, q_other]
+            _masked_write(
+                current_input_cache[:, k, write_position : write_position + 1],
+                input_tokens[:, q_other],
             )
 
         # Only for the very beginning, we extend the initial token for the acoustic
@@ -760,6 +796,10 @@ class MoshiVisGen(StreamingModule):
         position = current_offset % dcache_len
         for k, delay in enumerate(lm_model.delays):
             if current_offset <= delay:
+                # Initial-token broadcast happens once at session start -- it's
+                # safe to always apply (the exec_mask would skip it for idle
+                # slots, but those slots have nothing meaningful in their cache
+                # at this point anyway, so the broadcast is harmless).
                 current_input_cache[:, k, position] = self.initial_token[:, k, 0]
 
         # Transformer forward
@@ -812,13 +852,28 @@ class MoshiVisGen(StreamingModule):
         # Write generated tokens
         current_offset += 1
         position = current_offset % dcache_len
-        current_input_cache[:, 0, position] = text_token
-        current_input_cache[
-            :,
-            lm_model.audio_offset : lm_model.num_audio_codebooks_out
-            + lm_model.audio_offset,
-            position,
-        ] = audio_tokens
+        # Broadcast user-batch tokens to internal-batch cache (under CFG the
+        # cache has B=2 user-batch slots; the same generated token goes to
+        # both pos+null branches since the cache holds the actual generation).
+        if self._cfg:
+            text_token_for_cache = text_token.repeat(2)
+            audio_tokens_for_cache = audio_tokens.repeat(2, 1)
+        else:
+            text_token_for_cache = text_token
+            audio_tokens_for_cache = audio_tokens
+        _masked_write(
+            current_input_cache[:, 0, position],
+            text_token_for_cache,
+        )
+        _masked_write(
+            current_input_cache[
+                :,
+                lm_model.audio_offset : lm_model.num_audio_codebooks_out
+                + lm_model.audio_offset,
+                position,
+            ],
+            audio_tokens_for_cache,
+        )
 
         # if <= max_delay, we continue partial-generation
         # until removing all ungenerated tokens

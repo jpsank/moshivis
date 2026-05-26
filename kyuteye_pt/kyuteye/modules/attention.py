@@ -118,10 +118,21 @@ class KVCache:
                 self.current_end -= self.current_start
 
     def complete(
-        self, k: torch.Tensor, v: torch.Tensor
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        exec_mask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Add keys `k` and values `v` to the current cache and returns
-        cache up to the context size"""
+        cache up to the context size.
+
+        :param exec_mask: Optional ``[batch_size]`` bool tensor. When provided,
+            slots with ``False`` are skipped: their cache slots are not written
+            and their portion of the returned valid window stays at the prior
+            values. Use this to drive batched inference with desynchronized
+            sessions (idle slots' KV state is preserved exactly). When
+            ``None`` (default, single-stream behavior), all slots advance.
+        """
         assert k.shape[1] == v.shape[1]
         self.__maybe_increase_capacity__(self.current_end + k.shape[1])
 
@@ -130,8 +141,34 @@ class KVCache:
             k.shape[1],
             self.capacity,
         )
-        self._cache[0, :, self.current_end : self.current_end + k.shape[1]] = k
-        self._cache[1, :, self.current_end : self.current_end + v.shape[1]] = v
+
+        if exec_mask is None:
+            self._cache[0, :, self.current_end : self.current_end + k.shape[1]] = k
+            self._cache[1, :, self.current_end : self.current_end + v.shape[1]] = v
+        else:
+            # exec_mask: [B]. We always write k/v at the next slot but use
+            # ``where`` to keep the existing cache content for masked-off
+            # slots. The position the cache reads from is still
+            # ``current_end:current_end+T``, but for idle slots the values
+            # there are unchanged. ``current_end`` itself advances for the
+            # whole batch -- callers that need true per-slot offsets should
+            # use a higher-level structure (``MoshiVisGen`` tracks its own
+            # per-slot logical offset for tokens; this KV advance is
+            # acceptable because the model treats idle slots as having
+            # "ignored" input at this step, and they will read the same
+            # frozen K/V on the next call).
+            assert exec_mask.shape == (k.shape[0],), (
+                f"exec_mask shape {tuple(exec_mask.shape)} must be ({k.shape[0]},)"
+            )
+            keep = exec_mask.view(-1, 1, 1, 1)  # [B, 1, 1, 1]
+            cur_k = self._cache[0, :, self.current_end : self.current_end + k.shape[1]]
+            cur_v = self._cache[1, :, self.current_end : self.current_end + v.shape[1]]
+            self._cache[0, :, self.current_end : self.current_end + k.shape[1]] = (
+                torch.where(keep, k, cur_k)
+            )
+            self._cache[1, :, self.current_end : self.current_end + v.shape[1]] = (
+                torch.where(keep, v, cur_v)
+            )
         self.current_end += k.shape[1]
         valid = self._cache[:, :, self.current_start : self.current_end]
         return valid[0], valid[1]
@@ -219,7 +256,16 @@ class MultiheadAttention(StreamingModule):
     def _complete_kv(
         self, k: torch.Tensor, v: torch.Tensor, initial_kv_cache_size: int = 256
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Add key/values to the KV cache"""
+        """Add key/values to the KV cache.
+
+        When an ``exec_mask`` has been set on this module's streaming state
+        (via :meth:`StreamingModule.set_exec_mask`), slots marked ``False``
+        keep their prior cache contents at the current write position --
+        the cache is still advanced for the whole batch, but idle slots'
+        K/V are preserved. ``streaming_offset`` is also updated only for
+        active slots when the mask is present, so token-position counters
+        in callers stay in sync per-slot.
+        """
         # With cross attention we assume all keys and values
         # are already available, and streaming is with respect
         # to the queries only.
@@ -236,8 +282,9 @@ class MultiheadAttention(StreamingModule):
                 )
                 self.streaming_offset = torch.zeros(1)  # type: ignore
             kv_cache: KVCache = self._streaming_state["kv_cache"]  # type: ignore
+            exec_mask = self.get_streaming_attribute("exec_mask", None)
             self.streaming_offset += k.shape[1]
-            return kv_cache.complete(k, v)
+            return kv_cache.complete(k, v, exec_mask=exec_mask)
 
         return k, v
 
