@@ -75,6 +75,7 @@ from kyuteye.models.helium import Helium
 from kyuteye.modules.streaming_utils import StreamingModule
 from kyuteye.modules.transformer import Transformer
 from kyuteye.modules.utils import ClampedEmbedding
+from moshi.utils.compile import CUDAGraphed
 from moshi.utils.sampling import sample_token
 
 
@@ -429,6 +430,7 @@ class MoshiVisGen(StreamingModule):
         on_text_logits_hook: Optional[Callable[[torch.Tensor], None]] = None,
         on_audio_hook: Optional[Callable[[torch.Tensor], None]] = None,
         support_out_of_sync: bool = False,
+        use_cuda_graph: Optional[bool] = None,
     ):
         """Initialize a streaming-inference wrapper.
 
@@ -464,6 +466,15 @@ class MoshiVisGen(StreamingModule):
             (``offset <= max_delay``) is skipped so callers always get an output
             tensor back. Matches MoshiRAG's flag at ``lm.py:577``; useful for
             batched deployments where different slots are at different offsets.
+        :param use_cuda_graph: When ``True`` (or ``None`` and device is CUDA),
+            wrap the main transformer forward and the depformer step in
+            :class:`moshi.utils.compile.CUDAGraphed` so repeated streaming
+            calls replay a captured CUDA graph (~10-20% speedup). The capture
+            requires every step to pass tensors of identical shape and dtype
+            (in particular: condition tensors must be either always-set or
+            always-``None`` -- enable ``force_streaming_sum=True`` if you
+            want non-None streaming-sum AND graph capture). Default is
+            ``None`` = auto-enable on CUDA, auto-disable elsewhere.
         """
         assert not moshi_vis.training, "generation shouldn't be used in training mode."
         super().__init__()
@@ -493,6 +504,24 @@ class MoshiVisGen(StreamingModule):
         self.on_audio_hook = on_audio_hook
         self.support_out_of_sync = support_out_of_sync
         self._null_condition_tensors = null_condition_tensors
+
+        # CUDA graph capture wraps the main transformer + depformer forward
+        # so streaming replay is cheap. Auto-enable on CUDA, auto-disable
+        # elsewhere (matches MoshiRAG ``LMGen._init_streaming_state`` lines 669-674).
+        if use_cuda_graph is None:
+            self._cuda_graph_enabled = self.lm_model.device.type == "cuda"
+        else:
+            self._cuda_graph_enabled = bool(use_cuda_graph)
+        disable_graph = not self._cuda_graph_enabled
+        self._graphed_forward_text = CUDAGraphed(
+            self.lm_model.forward_text, disable=disable_graph
+        )
+        if self.lm_model.depformer is not None:
+            self._graphed_depformer_step = CUDAGraphed(
+                self._depformer_step_impl, disable=disable_graph
+            )
+        else:
+            self._graphed_depformer_step = None  # type: ignore[assignment]
 
         if cfg_is_masked_until is not None:
             assert self._cfg, (
@@ -999,11 +1028,17 @@ class MoshiVisGen(StreamingModule):
         streaming_sum = self.apply_pending_streaming_sum_condition(
             batch_size=user_batch_size
         )
-        transformer_out, text_logits, gate_weight = self.lm_model.forward_text(
+        # Route through the CUDA-graphed wrapper (no-op when disabled).
+        # The wrapper calls ``lm_model.forward_text`` with the same positional
+        # signature; ``gate_weight`` is now returned as a 0-d tensor so the
+        # graph capture doesn't have to deal with host-side scalar syncs.
+        transformer_out, text_logits, gate_weight = self._graphed_forward_text(
             input_,
-            cross_attention_src=ca_src,
-            sum_condition=self._condition_sum,
-            streaming_sum_condition=streaming_sum,
+            ca_src,
+            None,  # cross_attention_mask
+            None,  # attention_mask
+            self._condition_sum,
+            streaming_sum,
         )
 
         # CFG: split the doubled-batch text logits into positive + null halves
@@ -1102,9 +1137,26 @@ class MoshiVisGen(StreamingModule):
         # only cares about the positive branch's generated tokens.
         if self._cfg:
             out = out[:user_batch_size]
+        # ``gate_weight`` comes back as a 0-d tensor (so the upstream
+        # transformer forward stays CUDA-graph-safe). Convert to Python
+        # float here, outside any graph, for the legacy server consumers
+        # that expect a scalar.
+        if isinstance(gate_weight, torch.Tensor):
+            gate_weight = float(gate_weight.detach().cpu().item())
         return out, gate_weight
 
     def depformer_step(
+        self,
+        text_token: torch.Tensor,
+        transformer_out: torch.Tensor,
+    ) -> torch.Tensor:
+        """One depformer step. Dispatches through the CUDA-graphed wrapper if
+        capture is enabled, else calls the plain impl directly."""
+        if self._graphed_depformer_step is not None:
+            return self._graphed_depformer_step(text_token, transformer_out)
+        return self._depformer_step_impl(text_token, transformer_out)
+
+    def _depformer_step_impl(
         self,
         text_token: torch.Tensor,
         transformer_out: torch.Tensor,
@@ -1118,6 +1170,9 @@ class MoshiVisGen(StreamingModule):
         through ``forward_depformer``, then interpolate each codebook's logits
         before sampling -- mirrors MoshiRAG's depformer_step at
         ``moshi-rag/moshi/moshi/models/lm.py:906``.
+
+        Separate from :meth:`depformer_step` so we can wrap the implementation
+        in :class:`CUDAGraphed` without also capturing the dispatcher.
         """
         user_batch_size = text_token.shape[0]
         depformer_tokens: list[torch.Tensor] = []
