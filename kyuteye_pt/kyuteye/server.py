@@ -491,6 +491,7 @@ def start_server(
     omni_tool_end: str = "]",
     omni_arc_encoder_url: Optional[str] = None,
     omni_injection_mode: Literal["xa", "streaming_sum", "off"] = "xa",
+    batch_size: int = 1,
 ) -> None:
     """Start server
 
@@ -532,6 +533,12 @@ def start_server(
           in the model config and a running ARC encoder service; this is the
           MoshiRAG-faithful path).
         * ``off``: only surface to the UI, do not touch the model.
+    :param batch_size: When > 1, the server runs in batched mode using
+        :class:`kyuteye.batched.BatchedServerState`, serving up to
+        ``batch_size`` concurrent WebSocket sessions in parallel through
+        a single batched step loop. Limitation: a new session can only
+        join when the pool is fully empty (no per-slot reset yet); see
+        the ``kyuteye/batched.py`` module docstring for details.
     """
     assert kyuteye_config_path is not None
     root_dir = Path(__file__).parents[2]
@@ -603,6 +610,36 @@ def start_server(
         tool_names = default_registry.names()
         log("info", f"omni tools registered: {tool_names or '(none)'}")
 
+    if batch_size > 1:
+        from kyuteye.batched import BatchedServerState
+
+        state: Any = BatchedServerState(
+            mimi=mimi,
+            text_tokenizer=text_tokenizer,
+            moshi_vis=moshi_vis,
+            image_encoder_model=image_embedder,
+            device=device,
+            batch_size=batch_size,
+            dtype=torch_dtype,
+            xa_start=kyuteye_config.xa_start,
+            omni_enabled=omni_enabled,
+            omni_rag_trigger=omni_rag_trigger,
+            omni_rag_timeout=omni_rag_timeout,
+            omni_rag_max_tokens=omni_rag_max_tokens,
+            omni_rag_wait_steps=omni_rag_wait_steps,
+            omni_xa_injection=omni_xa_injection,
+            omni_tool_start=omni_tool_start,
+            omni_tool_end=omni_tool_end,
+            omni_arc_encoder_url=omni_arc_encoder_url,
+            omni_injection_mode=omni_injection_mode,
+        )
+        log("info", f"batched mode enabled (batch_size={batch_size})")
+        state.warmup()
+        app = web.Application()
+        app.router.add_get("/api/chat", state.handle_chat)
+        _finish_app(app, static_path, host, port, ssl, ssl_cert_dir, root_dir)
+        return
+
     state = ServerState(
         mimi=mimi,
         text_tokenizer=text_tokenizer,
@@ -626,6 +663,25 @@ def start_server(
     state.warmup()
     app = web.Application()
     app.router.add_get("/api/chat", state.handle_chat)
+    _finish_app(app, static_path, host, port, ssl, ssl_cert_dir, root_dir)
+
+
+def _finish_app(
+    app: web.Application,
+    static_path: str,
+    host: str,
+    port: int,
+    ssl: bool,
+    ssl_cert_dir: Optional[str],
+    root_dir: Path,
+) -> None:
+    """Attach static routes + SSL + start the aiohttp app.
+
+    Extracted so the single-stream and batched server entry points share
+    the same web setup. ``setup_tunnel`` was kept here as a no-op slot --
+    the original ``start_server`` had a tunnel hook that was always None
+    in practice and we preserve that by simply omitting it.
+    """
 
     async def handle_root(_):  # type: ignore
         return web.FileResponse(os.path.join(static_path, "index.html"))
@@ -647,17 +703,6 @@ def start_server(
         protocol = "https"
 
     log("info", f"Access the Web UI directly at {protocol}://{host}:{port}")
-    if setup_tunnel is not None:
-        tunnel = setup_tunnel("localhost", port, tunnel_token, None)
-        log(
-            "info",
-            f"Tunnel started, if executing on a remote GPU, you can use {tunnel}.",
-        )
-        log(
-            "info",
-            "Note that this tunnel goes through the US and you"
-            " might experience high latency in Europe.",
-        )
     with torch.no_grad():
         web.run_app(app, port=port, ssl_context=ssl_context)
 
