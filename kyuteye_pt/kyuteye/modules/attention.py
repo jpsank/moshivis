@@ -661,10 +661,27 @@ class MultiheadAttention(StreamingModule):
             if attention_mask is not None:
                 attn_mask = attn_mask & attention_mask
 
-        # Attention
+        # Attention. Causal masking is required for autoregressive training:
+        # in non-streaming forward, every query position can otherwise attend
+        # to every key position including future ones, which collapses
+        # next-token prediction to a trivial copy. The published MoshiVis is
+        # inference-only and never hit this path, so this attention layer
+        # had ``is_causal=False`` hardcoded. The fix is to honor
+        # ``self.causal`` when we're in non-streaming, non-cross-attention
+        # mode AND the caller hasn't supplied an explicit ``attn_mask``
+        # (``scaled_dot_product_attention`` doesn't accept both
+        # ``is_causal=True`` and a custom mask in the same call). Streaming
+        # mode stays implicitly causal via the per-slot ``end_offset`` /
+        # positions logic upstream of this call.
+        use_causal = (
+            self.causal
+            and not self._is_streaming
+            and not self.cross_attention
+            and attn_mask is None
+        )
         q, k, v = [x.transpose(1, 2) for x in [q, k, v]]
         x = torch.nn.functional.scaled_dot_product_attention(  # pylint: disable=not-callable
-            q, k, v, is_causal=False, attn_mask=attn_mask
+            q, k, v, is_causal=use_causal, attn_mask=attn_mask
         )
         x = x.transpose(1, 2)
 

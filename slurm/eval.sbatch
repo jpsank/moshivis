@@ -26,9 +26,43 @@ MAX_BATCHES="${MAX_BATCHES:-}"
 set -euo pipefail
 
 if [[ -z "$CHECKPOINT" ]]; then
-    echo "ERROR: set CHECKPOINT to the trained ckpt.pt path"
+    echo "ERROR: set CHECKPOINT to the trained ckpt.pt path (or to a save_dir to auto-resolve)"
     exit 1
 fi
+
+# Resolve CHECKPOINT if it points at a save_dir rather than a ckpt.pt.
+# The training trainer writes either a ``latest`` symlink (preferred)
+# or a ``latest.txt`` fallback for filesystems that don't permit
+# symlinks. The orchestration script (``scripts/run_pipeline.sh``)
+# passes ``$SAVE_DIR/latest/ckpt.pt`` -- works under symlinks, breaks
+# under the .txt fallback. Resolve both cases here so eval doesn't
+# fail on Lustre / GPFS clusters.
+if [[ ! -f "$CHECKPOINT" ]]; then
+    # Try to interpret CHECKPOINT as a save_dir.
+    POTENTIAL_SAVE_DIR="$(dirname "$(dirname "$CHECKPOINT")")"
+    [[ -d "$POTENTIAL_SAVE_DIR" ]] || POTENTIAL_SAVE_DIR="$CHECKPOINT"
+    if [[ -L "$POTENTIAL_SAVE_DIR/latest" ]]; then
+        CHECKPOINT="$POTENTIAL_SAVE_DIR/latest/ckpt.pt"
+    elif [[ -f "$POTENTIAL_SAVE_DIR/latest.txt" ]]; then
+        TARGET_NAME=$(cat "$POTENTIAL_SAVE_DIR/latest.txt" | tr -d '[:space:]')
+        CHECKPOINT="$POTENTIAL_SAVE_DIR/$TARGET_NAME/ckpt.pt"
+    else
+        LATEST_STEP_DIR=$(find "$POTENTIAL_SAVE_DIR" -maxdepth 1 -type d -name "step_*" | sort | tail -1)
+        if [[ -n "$LATEST_STEP_DIR" ]]; then
+            CHECKPOINT="$LATEST_STEP_DIR/ckpt.pt"
+        fi
+    fi
+fi
+
+if [[ ! -f "$CHECKPOINT" ]]; then
+    echo "ERROR: could not resolve checkpoint -- looked at:"
+    echo "  - the literal path"
+    echo "  - <parent>/latest symlink"
+    echo "  - <parent>/latest.txt fallback"
+    echo "  - highest <parent>/step_*/"
+    exit 1
+fi
+echo "[eval] using checkpoint: $CHECKPOINT"
 
 source "$REPO_ROOT/kyuteye_pt/.venv/bin/activate" 2>/dev/null || \
     echo "WARN: .venv not found; relying on ambient Python"

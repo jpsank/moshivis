@@ -42,7 +42,6 @@ from kyuteye.training import (
     RagJsonlDataset,
     Trainer,
     TrainerConfig,
-    apply_freeze_recipe,
     cleanup_distributed,
     init_distributed,
     is_main_process,
@@ -103,20 +102,33 @@ def main(
         dtype=torch_dtype,
     )
 
-    # Load the fine-tuned checkpoint on top of the base weights.
+    # Load the fine-tuned checkpoint on top of the base weights. The
+    # state-dict load is ``strict=False`` because the trainer saves only
+    # the trainable subset under a partial-freeze recipe; the
+    # already-loaded base weights cover the frozen portion. Assert the
+    # top-level keys are present so a corrupted / wrong-format
+    # checkpoint fails loud instead of silently leaving the base weights
+    # unchanged (which produced a misleading "trained but no improvement"
+    # signal in eval).
     state = torch.load(checkpoint, map_location="cpu", weights_only=True)
-    moshi_vis_gen.lm_model.load_state_dict(state.get("moshi_vis", {}), strict=False)
-    image_proj.load_state_dict(state.get("image_proj", {}), strict=False)
+    if "moshi_vis" not in state or "image_proj" not in state:
+        raise RuntimeError(
+            f"checkpoint {checkpoint!r} is missing required top-level keys; "
+            f"got {sorted(state.keys())}. Expected at least "
+            f"'moshi_vis' and 'image_proj'."
+        )
+    moshi_vis_gen.lm_model.load_state_dict(state["moshi_vis"], strict=False)
+    image_proj.load_state_dict(state["image_proj"], strict=False)
     if is_main_process(ctx):
         logging.info("[eval] loaded checkpoint at step %d", state.get("step", -1))
 
-    # Build a degenerate Trainer instance just to reuse its
-    # ``_build_conditioning`` and other plumbing. We don't actually call
-    # ``train()`` -- the Trainer is constructed only to delegate to its
-    # methods inside :func:`evaluate`.
-    apply_freeze_recipe(
-        "adapters_only", moshi_vis_gen.lm_model, image_proj, moshi_vis_gen
-    )
+    # Eval doesn't need a freeze recipe -- there's no backward pass and
+    # ``requires_grad`` flags don't affect the forward. We do build a
+    # degenerate Trainer instance below purely to reuse its
+    # ``training_model`` wrapper (which carries the DDP-correct
+    # conditioning + LM forward). The dataset passed in is the eval
+    # split; the Trainer's DataLoader isn't iterated here, ``evaluate``
+    # builds its own.
     dataset = RagJsonlDataset(data)
     if is_main_process(ctx):
         logging.info(

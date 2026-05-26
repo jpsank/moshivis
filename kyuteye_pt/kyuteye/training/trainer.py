@@ -336,8 +336,15 @@ class Trainer:
                 steps = self.step - last_log_step
                 steps_per_sec = steps / dt if dt > 0 else 0.0
                 lr = self.scheduler.get_last_lr()[0]
+                # ``accumulated_loss`` is already the *mean* across the N
+                # micro-batches in this step (each microbatch's loss was
+                # divided by N before .backward(), and we summed N of them
+                # -> sum/N = mean). Display that directly. The previous
+                # code multiplied by ``grad_accum_steps`` which produces
+                # the un-scaled SUM and made the displayed loss N times
+                # larger than the actual per-batch loss.
                 metrics = {
-                    "train/loss": accumulated_loss * self.config.grad_accum_steps,
+                    "train/loss": accumulated_loss,
                     "train/lr": lr,
                     "train/steps_per_sec": steps_per_sec,
                 }
