@@ -8,9 +8,9 @@ MoshiVis is Kyutai's Vision-Speech Model: a 7B [Moshi](https://github.com/kyutai
 
 The published MoshiVis is **inference-only**: the upstream repo and the published MoshiVis weights ship only inference code. This branch goes further: it ports MoshiRAG's full conditioning architecture (`ConditionProvider`, `ConditionFuser`, the ARC encoder, dropout utilities, CFG plumbing, per-slot multi-batch) on top of MoshiVis. The result is a codebase that is **inference-capable today and training-capable with a small additional trainer module**:
 
-- The architectural pieces a combined MoshiVis + MoshiRAG fine-tune needs are all present and trainable: ARC encoder, conditioners with `learnt_padding`, dropout utilities for CFG training, fuser routing.
-- What is **not** in this repo: the actual training loop (dataset/loader, loss, AdamW + LR schedule, distributed setup, checkpointing). See `kyuteye_pt/kyuteye/training/README.md` for the recommended fine-tune workflow and the scaffold module that exists.
-- The synthetic data generator (`ssvd/rag_augment.py`) produces JSONL examples in the format the planned trainer consumes.
+- The full training pipeline ships: `kyuteye_pt/kyuteye/training/` (DDP trainer, collator, eval harness, per-step streaming-sum, CFG dropout, pluggable WandB/TensorBoard logging, freeze recipes), Slurm batch templates in `slurm/`, and a one-command orchestration script `scripts/run_pipeline.sh` that submits preprocessing → training → eval as a Slurm dependency chain.
+- The synthetic data generator (`ssvd/rag_augment.py`) produces JSONL examples; `kyuteye.training.audio_preprocess` adds TTS-synthesized audio codes via a pluggable `BaseTTS` interface (`SilenceTTS` for pipeline validation, `CoquiXTTS` for real synthesis).
+- One-command HPC entry: `MIMI_WEIGHT=... DATA_JSONL=... EVAL_DATA=... scripts/run_pipeline.sh`. Required env vars + knobs documented in the script's header.
 
 Three independent backend implementations of the same model live side by side:
 

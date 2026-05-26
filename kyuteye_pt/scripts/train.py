@@ -76,12 +76,17 @@ def main(
     save_every: int = 500,
     log_every: int = 10,
     cfg_dropout_p: float = 0.0,
+    per_step_streaming_sum: bool = False,
     max_seq_len: int | None = 1024,
     dtype: str = "bfloat16",
     seed: int = 42,
     resume_dir: str | None = None,
     moshi_weight: str | None = None,
     log_level: str = "INFO",
+    log_backends: str = "python",
+    tb_log_dir: str | None = None,
+    wandb_project: str | None = None,
+    wandb_run_name: str | None = None,
 ) -> None:
     """Train MoshiVis + RAG with the configured freeze recipe.
 
@@ -179,10 +184,15 @@ def main(
         save_every=save_every,
         log_every=log_every,
         cfg_dropout_p=cfg_dropout_p,
+        per_step_streaming_sum=per_step_streaming_sum,
         save_dir=save_dir,
         seed=seed,
         dtype=dtype,
         resume_dir=resume_dir,
+        log_backends=log_backends,
+        tb_log_dir=tb_log_dir,
+        wandb_project=wandb_project,
+        wandb_run_name=wandb_run_name,
     )
     trainer = Trainer(
         moshi_vis=moshi_vis,

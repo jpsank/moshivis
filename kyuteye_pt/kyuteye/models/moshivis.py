@@ -321,9 +321,22 @@ class MoshiVis(StreamingModule):
             inputs_embeds = inputs_embeds + sum_condition.to(inputs_embeds)
 
         if streaming_sum_condition is not None:
-            assert (
-                streaming_sum_condition.shape[1] == inputs_embeds.shape[1] == 1
-            ), "streaming_sum_condition is only supported in streaming (seq_len=1) mode"
+            cond_T = streaming_sum_condition.shape[1]
+            in_T = inputs_embeds.shape[1]
+            # Two valid shapes:
+            #  * ``[B, 1, dim]`` -- single per-step row, the inference path
+            #    used by ``MoshiVisGen.step`` (and asserted ``in_T == 1``
+            #    via the streaming wrapper's contract).
+            #  * ``[B, in_T, dim]`` -- one row per LM position, the training
+            #    path used by ``Trainer._build_streaming_sum_per_step``.
+            #    Lets a full-sequence forward apply reference embeddings at
+            #    the positions immediately following each ``<ret>``, so the
+            #    ARC encoder's gradients flow position-accurately rather
+            #    than via the mean-pooled training simplification.
+            assert cond_T in (1, in_T), (
+                f"streaming_sum_condition seq_len {cond_T} must be 1 "
+                f"(inference per-step) or equal to input seq_len {in_T} (training)"
+            )
             inputs_embeds = inputs_embeds + streaming_sum_condition.to(inputs_embeds)
 
         # Pass through Helium

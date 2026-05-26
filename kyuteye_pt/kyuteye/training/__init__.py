@@ -30,11 +30,19 @@ from kyuteye.training.distributed import (
     init_distributed,
     is_main_process,
 )
+from kyuteye.training.eval import EvalResult, evaluate, log_eval
 from kyuteye.training.freeze import (
     FreezeReport,
     apply_freeze_recipe,
     freeze_recipes,
     summarize_freeze,
+)
+from kyuteye.training.logging_hooks import (
+    Logger,
+    PythonLogger,
+    TensorBoardLogger,
+    WandbLogger,
+    build_loggers,
 )
 from kyuteye.training.loss import next_token_ce_loss
 from kyuteye.training.trainer import Trainer, TrainerConfig
@@ -42,19 +50,27 @@ from kyuteye.training.trainer import Trainer, TrainerConfig
 __all__ = [
     "CollatedBatch",
     "DistributedContext",
+    "EvalResult",
     "FreezeReport",
+    "Logger",
+    "PythonLogger",
     "RagDataCollator",
     "RagExample",
     "RagJsonlDataset",
     "RagTurn",
+    "TensorBoardLogger",
     "Trainer",
     "TrainerConfig",
+    "WandbLogger",
     "apply_freeze_recipe",
     "barrier",
+    "build_loggers",
     "cleanup_distributed",
+    "evaluate",
     "freeze_recipes",
     "init_distributed",
     "is_main_process",
+    "log_eval",
     "next_token_ce_loss",
     "summarize_freeze",
 ]

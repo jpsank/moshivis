@@ -268,11 +268,73 @@ sequence length on a per-position basis -- not shipped because it
 needs design choices that depend on your data layout (how do you
 align a variable-length reference with the dialogue timeline?).
 
-## What still has to be written
+## Pluggable logging (WandB / TensorBoard)
 
-* **WandB / TensorBoard logging**. The trainer logs to Python logging
-  every `--log-every` steps. Wrap the log call in a hook if you want
-  experiment tracking.
-* **Per-step streaming-sum training** (see trade-off above).
-* **Evaluation harness** -- pick a held-out split and your preferred
-  speech metrics; we don't ship an evaluator.
+`kyuteye.training.logging_hooks` provides a `Logger` abstract base
+with three shipped backends:
+
+* `PythonLogger` -- default, prints to stdout.
+* `TensorBoardLogger` -- writes scalars + hparams via `SummaryWriter`.
+  `pip install tensorboard`.
+* `WandbLogger` -- mirrors to a Weights & Biases run. `pip install wandb`.
+  Use `mode="offline"` in `init_kwargs` for HPC nodes without internet
+  and `wandb sync` from a login node afterwards.
+
+Enable via `--log-backends python,tensorboard,wandb` (comma-separated;
+defaults to `python`). The trainer logs train loss, learning rate, and
+steps/sec every `--log-every` steps. Eval metrics from the held-out
+job land in the same logger backends.
+
+## Per-step streaming-sum training (faithful path)
+
+The `MoshiVis.forward_text` assertion was lifted to accept
+`streaming_sum_condition` of either `[B, 1, dim]` (inference per-step)
+or `[B, T_lm, dim]` (training per-position). With
+`--per-step-streaming-sum`, `Trainer._build_streaming_sum_per_step`
+finds the first `<ret>` token position per example and places the ARC
+encoder's reference embedding rows at `[ret_pos + 1, ret_pos + 1 + T_ref)`.
+The model now learns position-accurate streaming-sum consumption
+during training, matching MoshiRAG's inference semantics exactly.
+
+Requires the model to have `rag_token_id` set (in the YAML's `rag:` block).
+Without it, the trainer falls back to the mean-pool simplification
+documented above.
+
+## Evaluation
+
+`kyuteye.training.eval.evaluate(trainer, dataset)` runs the trainer's
+forward over a held-out JSONL split and aggregates token-weighted CE
+into a perplexity. Entry point: `scripts/eval.py`; Slurm template:
+`slurm/eval.sbatch`. Single-GPU is sufficient.
+
+```bash
+python scripts/eval.py \
+    --kyuteye-config configs/moshika-vis.yaml \
+    --checkpoint checkpoints/run_v1/latest/ckpt.pt \
+    --data data/eval.jsonl \
+    --audio-codes-dir data/eval_audio_codes/
+```
+
+Eval is teacher-forced (not free generation). For real generation
+quality you need a separate benchmark; this gives you a fast
+training-signal proxy that catches regressions.
+
+## One-command pipeline
+
+`scripts/run_pipeline.sh` submits preprocessing → training → eval as
+Slurm jobs with `afterok` dependencies:
+
+```bash
+MIMI_WEIGHT=/path/to/mimi.safetensors \
+DATA_JSONL=$PWD/data/augmented.jsonl \
+EVAL_DATA=$PWD/data/eval.jsonl \
+./scripts/run_pipeline.sh
+```
+
+Submits 3-4 jobs (training preprocess + eval preprocess in parallel,
+then train, then eval). Captures all job IDs to
+`$REPO_ROOT/.pipeline_jobs` for atomic cancellation
+(`scancel $(cat .pipeline_jobs)`). Knobs: `NUM_STEPS`, `BATCH_SIZE`,
+`LEARNING_RATE`, `FREEZE_RECIPE`, `TTS_BACKEND`, `SKIP_PREPROCESS=1`
+(reuse existing audio codes), `SKIP_EVAL=1` (train only). Full docs in
+the script's header comment.

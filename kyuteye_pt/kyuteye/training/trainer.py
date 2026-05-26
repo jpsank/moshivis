@@ -68,6 +68,8 @@ from kyuteye.training.distributed import (
     barrier,
     is_main_process,
 )
+from kyuteye.training.logging_hooks import Logger as _RunLogger
+from kyuteye.training.logging_hooks import build_loggers
 from kyuteye.training.loss import next_token_ce_loss
 
 if TYPE_CHECKING:
@@ -94,11 +96,24 @@ class TrainerConfig:
     save_every: int = 500
     log_every: int = 10
     cfg_dropout_p: float = 0.0  # 0 disables CFG dropout
+    # When True, the ARC encoder's reference embeddings are placed at LM
+    # positions immediately following each <ret> token (faithful per-step
+    # MoshiRAG semantics during training). When False (default), they are
+    # mean-pooled and folded into sum_condition (simpler, broadcast-applied
+    # across the full sequence). The model must have ``rag_token_id`` set
+    # for the per-step path to fire; without it we fall back to mean-pool.
+    per_step_streaming_sum: bool = False
     save_dir: str = "checkpoints"
     seed: int = 42
     dtype: str = "bfloat16"  # "bfloat16", "float16", or "float32"
     # Resume from this checkpoint dir if non-empty (loads latest step inside).
     resume_dir: Optional[str] = None
+    # Comma-separated logger backends. ``python`` (default), ``tensorboard``,
+    # ``wandb``. Multiple backends mirror metrics to each.
+    log_backends: str = "python"
+    tb_log_dir: Optional[str] = None
+    wandb_project: Optional[str] = None
+    wandb_run_name: Optional[str] = None
 
 
 class Trainer:
@@ -173,6 +188,26 @@ class Trainer:
         self.save_dir = Path(self.config.save_dir)
         if is_main_process(ctx):
             self.save_dir.mkdir(parents=True, exist_ok=True)
+
+        # Logging backends. Only rank 0 logs (the others would duplicate
+        # everything onto WandB and confuse the metric step).
+        if is_main_process(ctx):
+            self._loggers: list[_RunLogger] = build_loggers(
+                self.config.log_backends,
+                tb_log_dir=self.config.tb_log_dir or str(self.save_dir / "tb"),
+                wandb_project=self.config.wandb_project,
+                wandb_run_name=self.config.wandb_run_name,
+            )
+            for lg in self._loggers:
+                lg.log_hparams(
+                    {
+                        k: v
+                        for k, v in self.config.__dict__.items()
+                        if isinstance(v, (int, float, str, bool, type(None)))
+                    }
+                )
+        else:
+            self._loggers = []
 
         # DataLoader. Distributed sampler when running under DDP so each
         # rank sees a disjoint partition.
@@ -292,14 +327,13 @@ class Trainer:
                 steps = self.step - last_log_step
                 steps_per_sec = steps / dt if dt > 0 else 0.0
                 lr = self.scheduler.get_last_lr()[0]
-                logger.info(
-                    "[trainer] step %d/%d  loss=%.4f  lr=%.2e  %.2f steps/s",
-                    self.step,
-                    self.config.num_steps,
-                    accumulated_loss * self.config.grad_accum_steps,
-                    lr,
-                    steps_per_sec,
-                )
+                metrics = {
+                    "train/loss": accumulated_loss * self.config.grad_accum_steps,
+                    "train/lr": lr,
+                    "train/steps_per_sec": steps_per_sec,
+                }
+                for lg in self._loggers:
+                    lg.log_scalars(self.step, metrics)
                 last_log_time = now
                 last_log_step = self.step
 
@@ -313,6 +347,8 @@ class Trainer:
         barrier(self.ctx)
         if is_main_process(self.ctx):
             logger.info("[trainer] done. checkpoints in %s", self.save_dir)
+            for lg in self._loggers:
+                lg.close()
 
     def _infinite_dataloader(self):
         """Loop the dataloader forever, reseeding the distributed sampler each epoch."""
@@ -330,30 +366,37 @@ class Trainer:
         condition_attributes: list,
         device: torch.device,
         inner_model: "MoshiVis",
-    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Build ``sum_condition`` for the LM's full-sequence training forward.
+        *,
+        text_input_ids: Optional[torch.Tensor] = None,
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Build per-method conditioning tensors for the training forward.
 
         Calls the model's ``condition_provider`` to encode the
         :class:`ConditionAttributes` list, then the ``fuser`` to route the
-        results into the per-method slots. For training we collapse
-        ``streaming_sum`` (which assumes ``seq_len=1`` per step at inference)
-        into ``sum_condition`` by mean-pooling the reference embeddings
-        over their sequence dimension; this gives the LM a single
-        broadcast-applicable conditioning vector that exercises the ARC
-        encoder's gradient path. Trade-off vs MoshiRAG's training is
-        documented in ``training/README.md``.
+        results into the per-method slots. The ``streaming_sum`` output
+        is handled differently depending on ``per_step_streaming_sum``:
 
-        Returns ``(sum_condition, cross_condition_from_fuser)`` -- the
-        latter is the fuser's ``cross`` output if any, which the caller
-        merges with the image cross-attention KV (or rejects if both are
-        set, matching the loader's collision check).
+        * When ``False`` (default), the [B, T_ref, dim] streaming-sum
+          tensor is mean-pooled over its sequence dim and folded into
+          ``sum_condition`` so it broadcasts over the LM's full training
+          sequence. Simpler; the ARC encoder still gets gradient signal
+          but per-step temporal alignment is lost.
+        * When ``True`` AND ``text_input_ids`` is given, the streaming-
+          sum rows are placed at the LM positions immediately following
+          each ``<ret>`` token, producing a ``[B, T_lm, dim]`` tensor that
+          ``MoshiVis.forward_text`` accepts in its multi-step path. This
+          mirrors MoshiRAG's per-step inference semantics during training.
+
+        Returns ``(sum_condition, cross_condition_from_fuser,
+        streaming_sum_per_step)``. The third element is ``None`` unless
+        the per-step path is active.
         """
         if (
             inner_model.condition_provider is None
             or inner_model.fuser is None
             or not condition_attributes
         ):
-            return None, None
+            return None, None, None
 
         prepared = inner_model.condition_provider.prepare(condition_attributes)
         condition_tensors = inner_model.condition_provider(prepared)
@@ -362,21 +405,76 @@ class Trainer:
         streaming_sum = inner_model.fuser.get_streaming_sum(condition_tensors)
         cross_cond = inner_model.fuser.get_cross(condition_tensors)
 
-        # Collapse streaming_sum [B, T_ref, dim] → [B, 1, dim] by mean
-        # pooling so it broadcasts over the LM's full training sequence
-        # exactly like sum_condition does. This is a deliberate training-
-        # time simplification of MoshiRAG's per-step semantics; the ARC
-        # encoder still gets gradient signal but the per-step temporal
-        # alignment is lost. Re-enable per-step at inference time -- the
-        # streaming_sum queue in ``MoshiVisGen`` is unchanged.
+        streaming_sum_per_step: Optional[torch.Tensor] = None
         if streaming_sum is not None and streaming_sum.shape[1] > 0:
-            streaming_sum_pooled = streaming_sum.mean(dim=1, keepdim=True)
-            if sum_cond is None:
-                sum_cond = streaming_sum_pooled
+            rag_token_id = getattr(inner_model, "rag_token_id", None)
+            if (
+                self.config.per_step_streaming_sum
+                and text_input_ids is not None
+                and rag_token_id is not None
+            ):
+                # Per-step path: align reference rows to <ret> positions.
+                streaming_sum_per_step = self._build_streaming_sum_per_step(
+                    text_input_ids=text_input_ids,
+                    reference_embeddings=streaming_sum,
+                    rag_token_id=rag_token_id,
+                )
             else:
-                sum_cond = sum_cond + streaming_sum_pooled.to(sum_cond)
+                # Mean-pool fallback: broadcastable across all LM positions.
+                streaming_sum_pooled = streaming_sum.mean(dim=1, keepdim=True)
+                if sum_cond is None:
+                    sum_cond = streaming_sum_pooled
+                else:
+                    sum_cond = sum_cond + streaming_sum_pooled.to(sum_cond)
 
-        return sum_cond, cross_cond
+        return sum_cond, cross_cond, streaming_sum_per_step
+
+    def _build_streaming_sum_per_step(
+        self,
+        *,
+        text_input_ids: torch.Tensor,
+        reference_embeddings: torch.Tensor,
+        rag_token_id: int,
+    ) -> torch.Tensor:
+        """Align reference embeddings to per-position streaming-sum rows.
+
+        For each example, find the first ``<ret>`` token position in
+        ``text_input_ids[b]`` and copy ``reference_embeddings[b]`` to
+        ``[ret_pos + 1, ret_pos + 1 + T_ref)`` in the output. Positions
+        outside that window stay at zero. If an example has no
+        ``<ret>``, the output is all zeros for that row (the LM just
+        gets no reference signal -- which is the desired behavior).
+
+        :param text_input_ids: ``[B, T_lm]`` long tensor of text tokens
+            (channel 0 of the model's ``input_ids``).
+        :param reference_embeddings: ``[B, T_ref, dim]`` float tensor
+            from the fuser's ``get_streaming_sum``.
+        :param rag_token_id: SentencePiece token id of the learned
+            ``<ret>`` token. Lives on ``MoshiVis.rag_token_id`` when the
+            model was configured with one; ``None`` in that field
+            disables this path (and we fall back to mean-pool).
+        """
+        B, T_lm = text_input_ids.shape
+        _, T_ref, dim = reference_embeddings.shape
+        out = torch.zeros(
+            B,
+            T_lm,
+            dim,
+            device=reference_embeddings.device,
+            dtype=reference_embeddings.dtype,
+        )
+        ret_mask = text_input_ids == rag_token_id  # [B, T_lm]
+        for b in range(B):
+            positions = ret_mask[b].nonzero(as_tuple=False).flatten()
+            if positions.numel() == 0:
+                continue
+            ret_pos = int(positions[0].item())
+            start = ret_pos + 1
+            end = min(start + T_ref, T_lm)
+            length = max(0, end - start)
+            if length > 0:
+                out[b, start:end] = reference_embeddings[b, :length]
+        return out
 
     def _forward_one_microbatch(self, batch: CollatedBatch) -> torch.Tensor:
         """Forward one micro-batch and return the (unscaled) loss.
@@ -425,8 +523,13 @@ class Trainer:
             else self.moshi_vis
         )
 
-        sum_condition, fuser_cross = self._build_conditioning(
-            condition_attrs, device, inner
+        # Per-step streaming-sum requires the text input ids to find <ret>
+        # positions; pass them in so the conditioning builder can align.
+        sum_condition, fuser_cross, streaming_sum_per_step = self._build_conditioning(
+            condition_attrs,
+            device,
+            inner,
+            text_input_ids=input_ids[:, 0],
         )
 
         # Resolve the cross-attention source: prefer the explicit image
@@ -446,7 +549,12 @@ class Trainer:
             transformer_out, text_logits, _gate = inner.forward_text(
                 input_ids=input_ids,
                 cross_attention_src=ca_src,
-                sum_condition=sum_condition.to(device) if sum_condition is not None else None,
+                sum_condition=sum_condition.to(device)
+                if sum_condition is not None
+                else None,
+                streaming_sum_condition=streaming_sum_per_step.to(device)
+                if streaming_sum_per_step is not None
+                else None,
             )
             # text_logits comes out as [B, K_text=1, T, card]. Squeeze K_text.
             text_logits = text_logits.squeeze(1)
