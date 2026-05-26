@@ -23,6 +23,9 @@ from kyuteye.conditioners.base import (
     TensorCondition,
     _BaseTensorConditioner,
     _BaseTextConditioner,
+    dropout_all_conditions,
+    dropout_condition_,
+    dropout_tensor,
 )
 from kyuteye.conditioners.tensors import TensorConditioner
 from kyuteye.conditioners.text import LUTConditioner, NoopTokenizer
@@ -40,4 +43,7 @@ __all__ = [
     "TensorConditioner",
     "_BaseTensorConditioner",
     "_BaseTextConditioner",
+    "dropout_all_conditions",
+    "dropout_condition_",
+    "dropout_tensor",
 ]

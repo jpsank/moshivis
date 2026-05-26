@@ -147,22 +147,28 @@ def get_moshi_vis(
             device=device,
         )
         fuse2cond = {str(k): list(v) for k, v in rag_cfg.fuse2cond.items()}
-        # The image cross-attention path is owned by the vision encoder; routing
-        # extra conditions through the ``cross`` fuser slot would silently lose
-        # them because MoshiVis.forward_text takes ``cross_attention_src`` as
-        # an explicit parameter (the image KV) and ignores anything the fuser
-        # might produce on the cross channel. MoshiRAG never uses ``cross`` for
-        # text reference anyway (its default routes ``reference_with_time`` to
-        # ``streaming_sum``); rejecting the combination here makes the conflict
-        # surface at config-load time rather than silently degrading.
+        # Cross-attention conflict check. The image cross-attention path is
+        # owned by the vision encoder via ``MoshiVis.forward_text``'s
+        # ``cross_attention_src`` parameter. If the fuser's ``cross`` slot is
+        # also populated AND vision cross-attention is enabled
+        # (``num_crossattended_tokens != 0``), the fuser output would be
+        # silently dropped at forward time. We reject only in that explicit
+        # collision case -- a "text-only RAG over MoshiVis architecture" use
+        # case (no vision, with ``num_crossattended_tokens: 0`` in the YAML)
+        # is allowed and the fuser ``cross`` slot routes to
+        # ``cross_attention_src`` as MoshiRAG intends. MoshiRAG's own stock
+        # config doesn't use ``cross`` for text anyway (it uses
+        # ``streaming_sum``), so this collision is rare in practice.
         cross_conditions = fuse2cond.get("cross", [])
         if cross_conditions and bool(kyuteye_config.fuse.num_crossattended_tokens):
             raise ValueError(
                 f"rag.fuse2cond routes {cross_conditions!r} to the 'cross' slot, "
-                "but the vision cross-attention path already owns it. Use the "
-                "'streaming_sum' slot for reference text (this is the MoshiRAG "
-                "default), or disable vision cross-attention if you really want "
-                "to repurpose the slot."
+                "but vision cross-attention is also enabled "
+                f"(num_crossattended_tokens={kyuteye_config.fuse.num_crossattended_tokens}). "
+                "Pick one: use the 'streaming_sum' slot for reference text "
+                "(MoshiRAG default), or disable vision cross-attention with "
+                "``fuse.num_crossattended_tokens: 0`` to repurpose the cross slot "
+                "for the fuser output."
             )
         fuser = ConditionFuser(fuse2cond=fuse2cond)
         moshivis.condition_provider = provider

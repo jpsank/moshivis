@@ -185,6 +185,72 @@ class _BaseTensorConditioner(BaseConditioner[Prepared]):
     pass
 
 
+# ----------------------------------------------------------------------------
+# Training-time conditioner dropout utilities.
+#
+# Ported from moshi-rag/moshi/moshi/conditioners/base.py:201-245 so a future
+# training effort on top of this repo doesn't have to re-import them. These
+# operate on raw ``ConditionAttributes`` (before the provider encodes them);
+# the inference-time equivalent that zeros already-encoded ConditionTensors
+# lives at :func:`kyuteye.models.moshivis._dropped_condition_tensors`.
+#
+# Usage (during training): randomly call ``dropout_condition_`` on samples in
+# a batch so the model learns both ``p(x | condition)`` and ``p(x | null)``
+# distributions. Inference-time CFG sampling then interpolates between the
+# two via the ``cfg_coef`` parameter on :class:`MoshiVisGen`.
+# ----------------------------------------------------------------------------
+
+
+def dropout_tensor(condition: TensorCondition) -> TensorCondition:
+    """Return a zeroed copy of ``condition`` (tensor + mask). Verbatim from MoshiRAG."""
+    return TensorCondition(
+        tensor=torch.zeros_like(condition.tensor),
+        mask=torch.zeros_like(condition.mask),
+    )
+
+
+def dropout_condition_(
+    sample: ConditionAttributes, condition_type: str, condition: str
+) -> None:
+    """Nullify one named condition in-place. Verbatim from MoshiRAG."""
+    valid_conditions = ConditionAttributes.condition_types()
+    if condition_type not in valid_conditions:
+        raise ValueError(
+            f"dropout_condition got an unexpected condition_type {condition_type!r};"
+            f" expected one of {valid_conditions}"
+        )
+    bucket = getattr(sample, condition_type)
+    if condition not in bucket:
+        raise ValueError(
+            f"dropout_condition got an unexpected condition {condition!r} of type "
+            f"{condition_type!r}; sample has text={sample.text.keys()}, "
+            f"tensor={sample.tensor.keys()}"
+        )
+    if condition_type == "tensor":
+        sample.tensor[condition] = dropout_tensor(sample.tensor[condition])
+    elif condition_type == "text":
+        sample.text[condition] = None
+
+
+def dropout_all_conditions(
+    attributes: tp.Sequence[ConditionAttributes],
+) -> list[ConditionAttributes]:
+    """Return a list of ``ConditionAttributes`` with every condition nullified.
+
+    Useful for building the CFG null-branch input during training. Verbatim
+    from MoshiRAG's ``conditioners/base.py:233``. At inference we don't need
+    this -- :class:`MoshiVisGen` builds the null branch from encoded
+    condition tensors via ``_dropped_condition_tensors`` -- but it's here so
+    a training loop on top of this repo doesn't have to re-port it.
+    """
+    attributes = [a.copy() for a in attributes]
+    for condition_type in ConditionAttributes.condition_types():
+        for attribute in attributes:
+            for condition in getattr(attribute, condition_type):
+                dropout_condition_(attribute, condition_type, condition)
+    return attributes
+
+
 class ConditionProvider(nn.Module):
     """Holds the per-attribute conditioner modules and dispatches inputs."""
 
