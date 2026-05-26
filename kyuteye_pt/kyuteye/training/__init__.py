@@ -21,7 +21,15 @@ Importing this package does NOT require a GPU. The trainer itself, once
 written, will.
 """
 
+from kyuteye.training.collator import CollatedBatch, RagDataCollator
 from kyuteye.training.dataset import RagExample, RagJsonlDataset, RagTurn
+from kyuteye.training.distributed import (
+    DistributedContext,
+    barrier,
+    cleanup_distributed,
+    init_distributed,
+    is_main_process,
+)
 from kyuteye.training.freeze import (
     FreezeReport,
     apply_freeze_recipe,
@@ -29,14 +37,24 @@ from kyuteye.training.freeze import (
     summarize_freeze,
 )
 from kyuteye.training.loss import next_token_ce_loss
+from kyuteye.training.trainer import Trainer, TrainerConfig
 
 __all__ = [
+    "CollatedBatch",
+    "DistributedContext",
     "FreezeReport",
+    "RagDataCollator",
     "RagExample",
     "RagJsonlDataset",
     "RagTurn",
+    "Trainer",
+    "TrainerConfig",
     "apply_freeze_recipe",
+    "barrier",
+    "cleanup_distributed",
     "freeze_recipes",
+    "init_distributed",
+    "is_main_process",
     "next_token_ce_loss",
     "summarize_freeze",
 ]

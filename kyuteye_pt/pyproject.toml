@@ -52,6 +52,9 @@ arc = [
 [project.scripts]
 server = "kyuteye.server:main"
 sanity-check = "kyuteye.server:sanity_check"
+# train.py lives in scripts/ rather than as a kyuteye module since it's
+# a launcher (driven by torchrun under Slurm), not library code. Invoke
+# via ``torchrun ... scripts/train.py``; the Slurm template does this.
 
 [tool.mypy]
 python_version = "3.10"

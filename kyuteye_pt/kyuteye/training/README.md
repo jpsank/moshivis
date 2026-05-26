@@ -148,16 +148,70 @@ those parameters in the optimizer group.
 * **Evaluation harness** -- pick something off-the-shelf or write a
   small one against a held-out split of the SSVD-augmented JSONL.
 
-## Why we don't ship a `train.py`
+## The shipped trainer driver (`scripts/train.py`)
 
-Two reasons:
+A working trainer is now wired up end-to-end:
 
-1. **Truthfulness**. We haven't run a training step in this environment
-   (no GPU here). Shipping a `train.py` we haven't actually exercised
-   on real weights is the worst kind of code -- it looks done but
-   needs work the user can't predict. The scaffolding above is the
-   honest line between "we built this" and "you build this".
-2. **Hyperparameter-specificity**. The right LR, batch size, dropout
-   rate, schedule, etc. depend on your hardware, data size, and goal.
-   Codifying a single setup would be misleading. Use the suggested
-   values above as a starting point and tune from there.
+* **Entry point**: `kyuteye_pt/scripts/train.py`. Run under torchrun for
+  DDP. Driven by `fire`-style CLI flags.
+* **Collator**: `kyuteye.training.RagDataCollator` turns a batch of
+  `RagExample` into model input tensors. Loads pre-encoded audio codes
+  (`.pt` per example) and pre-computed image cross-attention KV (`.pt`
+  per image) from disk to keep per-step cost down.
+* **Trainer**: `kyuteye.training.Trainer` -- AdamW + linear warmup +
+  cosine decay, bf16 autocast, gradient clipping, periodic
+  checkpointing with a `latest` symlink, resume from latest, DDP wrap
+  with `find_unused_parameters=True` for the partial-freeze case.
+* **Slurm batch templates**: see `slurm/train_adapter.sbatch` and
+  `slurm/README.md` for single-node and multi-node patterns.
+
+Quick start on a single-node HPC allocation (4 GPUs):
+
+```bash
+cd $REPO_ROOT
+sbatch slurm/train_adapter.sbatch
+```
+
+Or directly via torchrun (skipping the Slurm wrapper):
+
+```bash
+cd $REPO_ROOT/kyuteye_pt
+torchrun --standalone --nproc_per_node=4 scripts/train.py \
+    --kyuteye-config configs/moshika-vis.yaml \
+    --data ../data/augmented.jsonl \
+    --audio-codes-dir ../data/audio_codes \
+    --precomputed-image-kv-dir ../data/image_kv \
+    --save-dir checkpoints/adapter_v1 \
+    --freeze-recipe adapters_only \
+    --num-steps 10000 \
+    --batch-size 8 \
+    --learning-rate 1e-4
+```
+
+Honest caveat: I wrote the trainer structurally per best-practice
+patterns (DDP via torchrun env vars, bf16 autocast around the forward,
+gradient clipping, decoupled weight decay, checkpoint/resume) but it
+hasn't been exercised on real GPU + weights from this environment.
+First run on your cluster will surface integration bugs. Plan for one
+shakeout day before scheduling the long-running fine-tune.
+
+## What still has to be written
+
+* **Audio preprocessing pipeline**. `ssvd/rag_augment.py` emits
+  text-only JSONL; the trainer expects per-example audio codes in
+  `--audio-codes-dir`. A preprocessing script that synthesizes TTS
+  audio for each turn and Mimi-encodes it isn't shipped because the
+  TTS choice is deployment-specific. The collator's audio contract is
+  small (one `.pt` file per example, shape `[n_audio_codebooks, T]`).
+  You can run a one-shot job on a TTS of your choice; document the
+  recipe in your fork.
+* **CFG dropout during training**. The trainer hardcodes the
+  `cfg_dropout_p` argument but doesn't yet wire it through to the
+  forward pass -- the static condition slots set up at
+  `MoshiVisGen.__init__` carry the conditioning. For a true CFG
+  training loop, override `Trainer._forward_one_microbatch` to apply
+  `dropout_all_conditions` per micro-batch and re-prepare the
+  ConditionTensors before the forward. ~30 lines of override code.
+* **WandB / TensorBoard logging**. The trainer logs to Python logging
+  every `--log-every` steps. Wrap the log call in a hook if you want
+  experiment tracking.
