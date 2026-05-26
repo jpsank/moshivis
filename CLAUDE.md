@@ -4,7 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repo is
 
-MoshiVis is Kyutai's Vision-Speech Model: a 7B [Moshi](https://github.com/kyutai-labs/moshi) speech-text foundation model augmented with ~206M cross-attention adapter parameters plus a frozen 400M PaliGemma2 vision encoder. It is **inference-only** code; training/finetuning is not in this repo.
+MoshiVis is Kyutai's Vision-Speech Model: a 7B [Moshi](https://github.com/kyutai-labs/moshi) speech-text foundation model augmented with ~206M cross-attention adapter parameters plus a frozen 400M PaliGemma2 vision encoder.
+
+The published MoshiVis is **inference-only**: the upstream repo and the published MoshiVis weights ship only inference code. This branch goes further: it ports MoshiRAG's full conditioning architecture (`ConditionProvider`, `ConditionFuser`, the ARC encoder, dropout utilities, CFG plumbing, per-slot multi-batch) on top of MoshiVis. The result is a codebase that is **inference-capable today and training-capable with a small additional trainer module**:
+
+- The architectural pieces a combined MoshiVis + MoshiRAG fine-tune needs are all present and trainable: ARC encoder, conditioners with `learnt_padding`, dropout utilities for CFG training, fuser routing.
+- What is **not** in this repo: the actual training loop (dataset/loader, loss, AdamW + LR schedule, distributed setup, checkpointing). See `kyuteye_pt/kyuteye/training/README.md` for the recommended fine-tune workflow and the scaffold module that exists.
+- The synthetic data generator (`ssvd/rag_augment.py`) produces JSONL examples in the format the planned trainer consumes.
 
 Three independent backend implementations of the same model live side by side:
 
