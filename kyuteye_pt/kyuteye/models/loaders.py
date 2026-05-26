@@ -201,6 +201,7 @@ def get_moshi_vis(
         moshi_vis=moshivis,
         condition_tensors=condition_tensors,
         force_streaming_sum=rag_enabled and rag_cfg.force_streaming_sum,
+        cfg_coef=rag_cfg.cfg_coef if rag_enabled else 1.0,
         **(gen_kwargs or {}),
     )
 

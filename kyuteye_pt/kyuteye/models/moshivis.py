@@ -8,7 +8,50 @@ from kyuteye.conditioners import (
     ConditionFuser,
     ConditionProvider,
     ConditionTensors,
+    ConditionType,
 )
+
+
+def _dropped_condition_tensors(condition_tensors: ConditionTensors) -> ConditionTensors:
+    """Return a copy of ``condition_tensors`` with all conditions zeroed out.
+
+    Used to build the "null" branch for classifier-free guidance: every
+    attribute's condition tensor is replaced with zeros and its mask with
+    a zeros mask, which makes the conditioner's ``learnt_padding`` (if any)
+    fill in instead. Mirrors what MoshiRAG produces by passing
+    :func:`dropout_all_conditions` through the provider.
+    """
+    return {
+        name: ConditionType(
+            torch.zeros_like(cond.condition), torch.zeros_like(cond.mask)
+        )
+        for name, cond in condition_tensors.items()
+    }
+
+
+def _cfg_stack(
+    pos: Optional[torch.Tensor], null: Optional[torch.Tensor]
+) -> Optional[torch.Tensor]:
+    """Stack ``[pos; null]`` along the batch dim for CFG. Either side may be ``None``."""
+    if pos is None and null is None:
+        return None
+    if pos is None:
+        pos = torch.zeros_like(null)
+    if null is None:
+        null = torch.zeros_like(pos)
+    return torch.cat([pos, null], dim=0)
+
+
+def _cfg_repeat(
+    x: Optional[torch.Tensor | Tuple[torch.Tensor, ...]],
+) -> Optional[torch.Tensor | Tuple[torch.Tensor, ...]]:
+    """Repeat a tensor (or each tensor in a tuple) along the batch dim for CFG."""
+    if x is None:
+        return None
+    if isinstance(x, tuple):
+        return tuple(_cfg_repeat(t) for t in x)  # type: ignore[return-value]
+    reps = [2] + [1] * (x.ndim - 1)
+    return x.repeat(*reps)
 from kyuteye.config.kyuteye_config import KyuteyeConfig
 from kyuteye.models.helium import Helium
 from kyuteye.modules.streaming_utils import StreamingModule
@@ -360,7 +403,17 @@ class MoshiVisGen(StreamingModule):
         check: bool = False,
         condition_tensors: Optional[ConditionTensors] = None,
         force_streaming_sum: bool = False,
+        cfg_coef: float = 1.0,
     ):
+        """Initialize a streaming-inference wrapper.
+
+        :param cfg_coef: Classifier-free-guidance coefficient. When ``!= 1.0``,
+            the model runs internally at double batch on every step (positive
+            and null-conditioned branches) and the text + depformer logits
+            are interpolated as ``null + (pos - null) * cfg_coef`` before
+            sampling. Requires conditioner-dropout training to be useful at
+            inference. Memory cost: 2x KV cache. Compute cost: 2x forward.
+        """
         assert not moshi_vis.training, "generation shouldn't be used in training mode."
         super().__init__()
 
@@ -380,6 +433,8 @@ class MoshiVisGen(StreamingModule):
         self.initial_token = self.lm_model.get_initial_token()
         self.condition_tensors = condition_tensors
         self.force_streaming_sum = force_streaming_sum
+        self.cfg_coef = cfg_coef
+        self._cfg = cfg_coef != 1.0
 
         # Pre-compute the static (per-session) condition slots from
         # ``condition_tensors``. MoshiRAG's ``LMGen._init_streaming_state``
@@ -400,6 +455,22 @@ class MoshiVisGen(StreamingModule):
             self._condition_cross = fuser.get_cross(condition_tensors)
             self._condition_prepend = fuser.get_prepend(condition_tensors)
             self._condition_streaming_sum_init = fuser.get_streaming_sum(condition_tensors)
+            # For CFG, stack the positive condition tensors with their null
+            # (all-attributes-dropped) counterpart along the batch dim. The
+            # streaming cache and per-step inputs are doubled to match; see
+            # :meth:`step`. Mirrors MoshiRAG's ``LMGen._init_streaming_state``
+            # when ``cfg_coef != 1.0``.
+            if self._cfg:
+                null_tensors = _dropped_condition_tensors(condition_tensors)
+                for name, fuse_method in (
+                    ("_condition_sum", "sum"),
+                    ("_condition_cross", "cross"),
+                    ("_condition_prepend", "prepend"),
+                    ("_condition_streaming_sum_init", "streaming_sum"),
+                ):
+                    pos = getattr(self, name)
+                    null = getattr(fuser, f"get_{fuse_method}")(null_tensors)
+                    setattr(self, name, _cfg_stack(pos, null))
             target_dtype = self.lm_model.llm.text_emb.weight.dtype
             for name in (
                 "_condition_sum",
@@ -411,10 +482,12 @@ class MoshiVisGen(StreamingModule):
                 if t is not None:
                     setattr(self, name, t.to(dtype=target_dtype))
         if self.force_streaming_sum and self._condition_streaming_sum_init is None:
-            # Allocate a zero ``[1, 1, dim]`` slot so the streaming_sum path
-            # is always exercised -- matches MoshiRAG's ``force_streaming_sum``.
+            # Allocate a zero ``[B, 1, dim]`` slot (B=2 under CFG) so the
+            # streaming_sum path is always exercised -- matches MoshiRAG's
+            # ``force_streaming_sum``.
+            B = 2 if self._cfg else 1
             self._condition_streaming_sum_init = torch.zeros(
-                1,
+                B,
                 1,
                 self.lm_model.llm.dim,
                 device=self.lm_model.device,
@@ -595,6 +668,13 @@ class MoshiVisGen(StreamingModule):
         the image KV (and optionally Omni text KV concatenated on top); we
         keep it as a parameter rather than routing through ``_condition_cross``
         because the vision path predates the conditioner machinery.
+
+        Under CFG (``cfg_coef != 1.0``), the user passes single-batch tokens and
+        single-batch ``ca_src``; the model runs internally at double batch and
+        the returned tokens are still single-batch (sampled from interpolated
+        logits). The caller is responsible for ensuring the model's transformer
+        streaming state was allocated for the doubled batch (i.e. invoking
+        ``moshi_vis.streaming_forever(2)`` instead of ``(1)`` when CFG is on).
         """
         state = self._streaming_state
         if state is None:
@@ -604,12 +684,19 @@ class MoshiVisGen(StreamingModule):
         lm_model = self.lm_model
 
         assert input_tokens.dim() == 3, "Shape should be [B, K, T]."
-        batch_size, num_codes, seq_len = input_tokens.shape
+        user_batch_size, num_codes, seq_len = input_tokens.shape
         assert seq_len == 1, "Only support being given steps one by one."
         needed_tokens = lm_model.num_codebooks - lm_model.num_audio_codebooks_out - 1
         assert (
             num_codes == needed_tokens
         ), f"We expect {needed_tokens} tokens from the user stream, got {num_codes}."
+
+        # CFG: double the input + ca_src so the model sees pos+null in one
+        # forward pass. The user-facing batch dim stays at ``user_batch_size``.
+        if self._cfg:
+            input_tokens = _cfg_repeat(input_tokens)  # type: ignore[assignment]
+            ca_src = _cfg_repeat(ca_src)  # type: ignore[assignment]
+        batch_size = input_tokens.shape[0]
 
         current_input_cache = self.get_streaming_attribute(
             "cache",
@@ -660,8 +747,15 @@ class MoshiVisGen(StreamingModule):
             streaming_sum_condition=streaming_sum,
         )
 
+        # CFG: split the doubled-batch text logits into positive + null halves
+        # and interpolate before sampling. ``transformer_out`` is kept doubled
+        # because :meth:`depformer_step` does its own CFG handling.
+        if self._cfg:
+            pos_logits, null_logits = text_logits.chunk(2, dim=0)
+            text_logits = null_logits + (pos_logits - null_logits) * self.cfg_coef
+
         # Sample text tokens
-        # Shape of text_logits should be [B, K_text=1, T=1, Card_text]
+        # Shape of text_logits should be [user_batch_size, K_text=1, T=1, Card_text]
         text_token = sample_token(
             text_logits.float(),
             self.use_sampling,
@@ -671,7 +765,7 @@ class MoshiVisGen(StreamingModule):
         assert text_token.dim() == 3, text_token.shape
         assert text_token.shape[2] == 1
         assert text_token.shape[1] == 1, "Only one text stream supported."
-        text_token = text_token[:, 0, 0]  # shape is [B]
+        text_token = text_token[:, 0, 0]  # shape is [user_batch_size]
 
         # Generate and sample audio tokens
         audio_tokens = self.depformer_step(text_token, transformer_out)
@@ -706,6 +800,10 @@ class MoshiVisGen(StreamingModule):
         out = current_input_cache.gather(dim=2, index=index)
         self.add_streaming_attribute("offset", current_offset)
         self.add_streaming_attribute("cache", current_input_cache)
+        # Under CFG, the cache holds both pos and null branches; the caller
+        # only cares about the positive branch's generated tokens.
+        if self._cfg:
+            out = out[:user_batch_size]
         return out, gate_weight
 
     def depformer_step(
@@ -713,8 +811,17 @@ class MoshiVisGen(StreamingModule):
         text_token: torch.Tensor,
         transformer_out: torch.Tensor,
     ) -> torch.Tensor:
-        """A step of the depformer"""
-        batch_size = text_token.shape[0]
+        """A step of the depformer.
+
+        Under CFG, ``text_token`` is single-batch (already sampled from the
+        interpolated main-LM logits) but ``transformer_out`` is double-batch
+        (pos+null halves) because the depformer's own KV cache was allocated
+        for the doubled batch. We repeat ``text_token`` to feed both halves
+        through ``forward_depformer``, then interpolate each codebook's logits
+        before sampling -- mirrors MoshiRAG's depformer_step at
+        ``moshi-rag/moshi/moshi/models/lm.py:906``.
+        """
+        user_batch_size = text_token.shape[0]
         depformer_tokens: list[torch.Tensor] = []
         assert self.lm_model.depformer is not None
 
@@ -722,16 +829,22 @@ class MoshiVisGen(StreamingModule):
             next_token = text_token[:, None, None]
 
             for cb_index in range(self.lm_model.num_audio_codebooks_out):
+                input_ = next_token
+                if self._cfg:
+                    input_ = input_.repeat(2, 1, 1)
                 logits = self.lm_model.forward_depformer(
-                    cb_index, next_token, transformer_out
+                    cb_index, input_, transformer_out
                 )
+                if self._cfg:
+                    pos_logits, null_logits = logits.chunk(2, dim=0)
+                    logits = null_logits + (pos_logits - null_logits) * self.cfg_coef
                 next_token = sample_token(
                     logits.float(),
                     self.use_sampling,
                     self.temp,
                     self.top_k,
                 )
-                assert next_token.shape == (batch_size, 1, 1)
+                assert next_token.shape == (user_batch_size, 1, 1)
                 depformer_tokens.append(next_token[:, 0, 0])
         out = torch.stack(depformer_tokens, dim=1)
         return out

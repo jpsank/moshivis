@@ -156,6 +156,12 @@ class RagConfig:
     # ``force_streaming_sum=True``).
     force_streaming_sum: bool = True
 
+    # Classifier-free-guidance coefficient. ``1.0`` (default) disables CFG.
+    # Values > 1 push generation toward the conditioned distribution; values
+    # < 1 push away. Requires conditioner-dropout training to produce
+    # meaningful null-branch outputs.
+    cfg_coef: float = 1.0
+
     # Conditioner registry. Maps attribute name -> {type, ...kwargs}.
     # Supported types: ``lut`` (LUTConditioner), ``tensor`` (TensorConditioner).
     # Example matching MoshiRAG defaults:
