@@ -45,8 +45,11 @@ omni = [
 ]
 arc = [
     # In-process ARC encoder (kyuteye.conditioners.arc_encoder).
-    # xformers needs a CUDA + PyTorch combo it likes; pin loosely.
-    "xformers >= 0.0.27",
+    # xformers is tightly coupled to a specific PyTorch version: 0.0.24
+    # is the release built against torch 2.2.0 (matching the project's
+    # torch pin). Bumping this requires bumping torch + torchvision in
+    # lock-step.
+    "xformers >= 0.0.24, < 0.0.26",
 ]
 
 [project.scripts]
