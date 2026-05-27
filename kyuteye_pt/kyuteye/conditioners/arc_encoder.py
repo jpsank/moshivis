@@ -609,13 +609,21 @@ class ArcEncoderConditioner(_BaseTextConditioner[TokenizedText]):
         autocast_dtype: tp.Optional[str] = "bfloat16",
         tokenizer_name: str = "meta-llama/Llama-3.2-3B-Instruct",
         hf_repo: tp.Optional[str] = None,
+        weights_path: tp.Optional[str] = None,
         **kwargs: tp.Any,
     ) -> None:
         # Probe for xformers up-front so a misconfigured deployment surfaces
         # the error at construction time, not on the first forward.
         _require_xformers()
 
+        # ``weights_path`` (optional) bypasses HuggingFace entirely:
+        # if set, ``load_weights`` reads ``model.safetensors`` from
+        # this local path. Use it on offline HPC compute nodes where
+        # ``hf_hub_download`` would fail. ``hf_repo`` is still honored
+        # if ``weights_path`` is not set, so existing configs continue
+        # to work unchanged on online environments.
         self._hf_repo = hf_repo
+        self._weights_path = weights_path
         self.finetune = finetune
 
         embedder_params = kwargs.pop("embedder_params", None)
@@ -663,22 +671,72 @@ class ArcEncoderConditioner(_BaseTextConditioner[TokenizedText]):
             self.bridge_module.eval()
 
     def load_weights(self) -> None:
-        """If ``hf_repo`` was set, load ``model.safetensors`` from HF.
+        """Load ARC encoder weights from disk or HuggingFace.
 
-        Called from :func:`kyuteye.models.loaders.get_moshi_vis` after the
-        main checkpoint load. No-op if ``hf_repo`` is unset.
+        Precedence:
+
+        1. ``weights_path`` (constructor kwarg): treat as a local
+           ``model.safetensors`` path or a directory containing one.
+           Use this on offline HPC compute nodes that can't reach
+           HuggingFace -- the trainer / orchestration script
+           pre-downloads the file on the login node and the path is
+           passed via the YAML config.
+        2. ``hf_repo`` (constructor kwarg): download ``model.safetensors``
+           from that HF repo. Respects ``HF_HUB_OFFLINE=1`` + a populated
+           ``HF_HOME`` cache for offline use (the user runs
+           ``huggingface-cli download`` once on a node with internet,
+           points ``HF_HOME`` at shared storage, and sets
+           ``HF_HUB_OFFLINE=1`` on the compute node).
+        3. Neither set: no-op. The conditioner stays at random init.
+           Loud warning logged so users don't silently train with a
+           random encoder.
+
+        Called from :func:`kyuteye.models.loaders.get_moshi_vis` after
+        the main checkpoint load.
         """
-        if not self._hf_repo:
-            return
         try:
-            from huggingface_hub import hf_hub_download
             from safetensors.torch import load_file
         except ImportError as e:
             raise ImportError(
-                "load_weights requires huggingface_hub and safetensors"
+                "load_weights requires safetensors"
             ) from e
-        path = hf_hub_download(self._hf_repo, "model.safetensors")
-        state = load_file(path, device=str(self.device))
+
+        if self._weights_path:
+            from pathlib import Path
+
+            p = Path(self._weights_path)
+            if p.is_dir():
+                p = p / "model.safetensors"
+            if not p.exists():
+                raise FileNotFoundError(
+                    f"ArcEncoderConditioner weights_path={p!s} not found. "
+                    f"Set the YAML's rag.conditioners.<name>.weights_path "
+                    f"to a local model.safetensors (or its directory)."
+                )
+            logger.info("[ARC] loading weights from local path: %s", p)
+            state = load_file(str(p), device=str(self.device))
+        elif self._hf_repo:
+            try:
+                from huggingface_hub import hf_hub_download
+            except ImportError as e:
+                raise ImportError(
+                    "load_weights from hf_repo requires huggingface_hub"
+                ) from e
+            logger.info(
+                "[ARC] loading weights from HF repo: %s (set HF_HUB_OFFLINE=1 "
+                "+ HF_HOME=/shared/cache for offline compute nodes)",
+                self._hf_repo,
+            )
+            path = hf_hub_download(self._hf_repo, "model.safetensors")
+            state = load_file(path, device=str(self.device))
+        else:
+            logger.warning(
+                "[ARC] no weights_path or hf_repo configured; conditioner "
+                "stays at random init. Streaming-sum injection will produce "
+                "noise. Set rag.conditioners.<name>.weights_path or hf_repo."
+            )
+            return
+
         self.load_state_dict(state, assign=True, strict=False)
         if self.finetune:
             self.embedder.train()

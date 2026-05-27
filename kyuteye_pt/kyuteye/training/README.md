@@ -1,5 +1,42 @@
 # Training: combined MoshiVis + MoshiRAG fine-tune
 
+## HPC setup (run once on a login node)
+
+Before submitting any Slurm job, run ``scripts/hpc_setup.sh`` ONCE from
+a login node with internet access. It does three things compute nodes
+can't do themselves:
+
+1. Installs the ``[arc]`` extra (xformers) into ``kyuteye_pt/.venv``.
+   The ARC encoder requires xformers; without it, training will
+   ``ImportError`` at startup. The vanilla ``uv sync`` doesn't include
+   the extra.
+2. Pre-downloads the ARC encoder tokenizer
+   (``meta-llama/Llama-3.2-3B-Instruct`` by default -- a **gated**
+   HuggingFace repo). You must accept the model license on
+   HuggingFace and run ``huggingface-cli login`` (or set ``HF_TOKEN``)
+   on the login node first.
+3. Optionally pre-caches MoshiVis + ARC encoder weights via
+   ``HF_HOME``. Set ``HF_HOME`` to shared storage so compute nodes see
+   the cache.
+
+```bash
+# On the login node:
+huggingface-cli login                  # paste your HF token
+export HF_HOME=/scratch/$USER/hf_cache  # shared with compute nodes
+export MOSHIVIS_HF_REPO=kyutai/moshika-vis-pytorch-bf16
+export ARC_HF_REPO=kyutai/moshika-rag-pytorch-bf16
+./scripts/hpc_setup.sh
+```
+
+After this, all sbatches in ``slurm/`` export ``HF_HUB_OFFLINE=1`` so
+they read from the local cache without making network calls.
+
+The ARC encoder conditioner also accepts a ``weights_path:`` field in
+the YAML config -- if you'd rather host the ``model.safetensors`` on
+shared storage directly instead of via the HF cache, point at it there.
+
+
+
 The architectural pieces a combined fine-tune needs are all in this
 branch -- ARC encoder, conditioners, fuser, CFG plumbing, dropout
 utilities, per-slot multi-batch. What's not here is the *training loop

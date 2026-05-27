@@ -64,6 +64,14 @@ if [[ ! -f "$CHECKPOINT" ]]; then
 fi
 echo "[eval] using checkpoint: $CHECKPOINT"
 
+# Offline HF mode: match the training sbatch so the ARC encoder (if
+# the eval config has rag.enabled=true) doesn't try to fetch the
+# tokenizer / weights from the network. Run ``scripts/hpc_setup.sh``
+# from a login node once to populate HF_HOME.
+export HF_HOME="${HF_HOME:-$REPO_ROOT/.cache/huggingface}"
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
+
 source "$REPO_ROOT/kyuteye_pt/.venv/bin/activate" 2>/dev/null || \
     echo "WARN: .venv not found; relying on ambient Python"
 mkdir -p logs

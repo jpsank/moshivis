@@ -12,10 +12,32 @@
 # MoshiVis + MoshiRAG. Edit the CONFIGURE block below to point at your
 # data + checkpoint paths, then submit with `sbatch train_adapter.sbatch`.
 #
-# Memory footprint (rough): 7B model in bf16 ≈ 14 GB weights + ~5-10 GB
-# activations + ~2 GB adapter grad/opt state ≈ ~25 GB per GPU at
-# batch_size=8. Comfortably fits on 4× A100 80GB; tight on 4× A100 40GB
-# (drop batch_size to 4 and increase grad_accum_steps to compensate).
+# Prerequisites:
+#   1. Run ``scripts/hpc_setup.sh`` ONCE on a login node with internet
+#      access. It installs the ``[arc]`` extra (xformers -- required by
+#      the ARC encoder), pre-caches the ARC tokenizer (a GATED repo
+#      requiring HF login), and optionally pre-caches MoshiVis + ARC
+#      weights via ``HF_HOME``.
+#   2. Point ``HF_HOME`` at shared storage so compute nodes see the
+#      cache populated by step 1. Set in the env block below.
+#
+# Memory footprint per GPU (rough, bf16 throughout):
+#   * Frozen 7B LM:                14 GB
+#   * Vision encoder (frozen):      1 GB
+#   * ARC encoder (3 GB weights):
+#       - frozen:                   3 GB
+#       - finetuned (default):    ~15 GB (weights + Adam state + activations)
+#   * Activations / grad state:    5-10 GB at batch_size=8
+#   * Adapter Adam state:          ~2 GB
+#   Totals at batch_size=8:
+#     adapters_only, ARC frozen:                 ~25-30 GB (40GB OK)
+#     adapters_only, ARC trainable (default):    ~40-45 GB (tight on 40GB)
+#     full_lm:                                   ~70 GB+  (80GB only)
+#
+# If you OOM on 40GB cards: drop batch_size to 4 and bump
+# grad_accum_steps to compensate, or set the ARC conditioner's
+# ``finetune: false`` in the YAML to keep it frozen during the adapter
+# phase.
 #
 # Multi-node training: this template is single-node. For multi-node DDP,
 # duplicate this file and add the standard rendezvous env vars
@@ -38,12 +60,31 @@ FREEZE_RECIPE="${FREEZE_RECIPE:-adapters_only}"
 
 set -euo pipefail
 
-# Activate the project's venv. ``uv sync`` should have created
-# ``$REPO_ROOT/kyuteye_pt/.venv``; if your cluster uses module load instead,
-# replace this with the equivalent module commands.
+# Offline-friendly HuggingFace mode: rely entirely on the cache populated
+# by ``scripts/hpc_setup.sh`` from the login node. Avoids network calls
+# from compute nodes that don't have internet (the ARC encoder's
+# AutoTokenizer + load_weights would otherwise hang / fail at startup).
+# ``HF_HOME`` must point at a directory the compute node can read
+# (typically shared scratch or project storage).
+export HF_HOME="${HF_HOME:-$REPO_ROOT/.cache/huggingface}"
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
+
+# Activate the project's venv. ``scripts/hpc_setup.sh`` creates this with
+# the ``[arc]`` extra installed (xformers); without that, the ARC
+# encoder will raise ImportError at training startup.
 source "$REPO_ROOT/kyuteye_pt/.venv/bin/activate" 2>/dev/null || {
-    echo "WARNING: .venv not found at $REPO_ROOT/kyuteye_pt/.venv -- "
-    echo "         relying on the ambient Python environment"
+    echo "WARNING: .venv not found at $REPO_ROOT/kyuteye_pt/.venv. Run"
+    echo "         ``scripts/hpc_setup.sh`` from a login node first."
+    echo "         Falling back to ambient Python -- xformers may be missing."
+}
+
+# Verify the ARC encoder's xformers dependency is actually available. The
+# import takes ~1s but failing here is a much better diagnostic than the
+# torchrun stack trace 30s later.
+python -c "import xformers" 2>/dev/null || {
+    echo "WARNING: xformers not importable. The ARC encoder requires it."
+    echo "         Run ``scripts/hpc_setup.sh`` or ``uv sync --extra arc``."
 }
 
 mkdir -p logs "$SAVE_DIR"
