@@ -1,0 +1,2 @@
+{"image_path": null, "turns": [{"role": "user", "text": "good morning"}, {"role": "moshi", "text": "good morning to you too"}]}
+{"image_path": null, "turns": [{"role": "user", "text": "whats the capital of france"}, {"role": "moshi", "text": "let me think", "rag_trigger": true}, {"role": "reference", "text": "Paris has been the capital of France since the year 987."}, {"role": "moshi", "text": "the capital of france is paris"}]}

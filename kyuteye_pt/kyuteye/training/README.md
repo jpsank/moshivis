@@ -379,6 +379,34 @@ EVAL_DATA=$PWD/data/eval.jsonl \
 ./scripts/run_pipeline.sh
 ```
 
+### Smoke-test mode
+
+Before generating real training data (which needs an external LLM
+endpoint), prove the pipeline kicks end-to-end with the canned tiny
+dataset at `data/smoke_test_{train,eval}.jsonl`:
+
+```bash
+SMOKE_TEST=1 ./scripts/run_pipeline.sh
+```
+
+What this does:
+
+* Substitutes the 5-example smoke-test JSONLs for `DATA_JSONL` and
+  `EVAL_DATA` (no LLM endpoint needed).
+* Sets `SKIP_PREPROCESS=1`, so audio preprocessing doesn't run; the
+  collator falls back to zero-fill audio codes (training signal is
+  text-only). This also drops the `MIMI_WEIGHT` requirement.
+* Shrinks `NUM_STEPS=20`, `BATCH_SIZE=2` so the training job finishes
+  in minutes.
+* Submits only the train + eval jobs (preprocessing skipped).
+
+The resulting checkpoint is **not useful for inference** -- this is a
+plumbing test. A successful run means: model loads, freeze recipe
+applies cleanly, DDP wraps without errors, collator builds batches,
+optimizer takes 20 steps, checkpoint saves, eval forward runs. Once
+this passes you've validated the cluster integration and can confidently
+invest in real data generation + a long training run.
+
 Submits 3-4 jobs (training preprocess + eval preprocess in parallel,
 then train, then eval). Captures all job IDs to
 `$REPO_ROOT/.pipeline_jobs` for atomic cancellation

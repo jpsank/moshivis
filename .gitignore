@@ -5,6 +5,8 @@ __pycache__
 *.ipynb*
 *.egg-info
 *.jsonl
+# Smoke-test fixtures live in-tree so SMOKE_TEST=1 works on a fresh clone.
+!data/smoke_test_*.jsonl
 nohup.out
 .idea/*
 client/node_modules

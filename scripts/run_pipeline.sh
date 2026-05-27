@@ -12,10 +12,27 @@
 #     EVAL_DATA=$REPO_ROOT/data/eval.jsonl \
 #     ./scripts/run_pipeline.sh
 #
+# Smoke-test mode (no data generation, no preprocessing):
+#
+#     # Proves the whole pipeline kicks before investing in real data.
+#     # Skips audio preprocessing (collator zero-fills), trains for 20
+#     # steps on the 5 canned dialogues in data/smoke_test_train.jsonl,
+#     # evaluates on data/smoke_test_eval.jsonl. End-to-end should finish
+#     # in well under an hour on any GPU node.
+#     SMOKE_TEST=1 ./scripts/run_pipeline.sh
+#
 # Inputs (env vars):
-#   MIMI_WEIGHT (required)        Path to Mimi safetensors checkpoint
-#   DATA_JSONL (required)         Training JSONL from ssvd/rag_augment.py
-#   EVAL_DATA (required)          Eval split JSONL (smaller held-out)
+#   SMOKE_TEST=1                  Run with canned tiny dataset, 20 steps,
+#                                 no preprocessing -- proves pipeline
+#                                 wiring without an LLM endpoint or TTS
+#                                 setup. Overrides defaults below.
+#   MIMI_WEIGHT (required unless  Path to Mimi safetensors checkpoint
+#     SKIP_PREPROCESS=1 or
+#     SMOKE_TEST=1)
+#   DATA_JSONL (required unless   Training JSONL from ssvd/rag_augment.py
+#     SMOKE_TEST=1)
+#   EVAL_DATA (required unless    Eval split JSONL (smaller held-out)
+#     SMOKE_TEST=1 or SKIP_EVAL=1)
 #   REPO_ROOT (default $HOME/moshivis)
 #   AUDIO_CODES_DIR               Where preprocessing writes audio codes
 #   EVAL_AUDIO_CODES_DIR          Same, for the eval split
@@ -42,10 +59,32 @@ AUDIO_CODES_DIR="${AUDIO_CODES_DIR:-$REPO_ROOT/data/audio_codes}"
 EVAL_AUDIO_CODES_DIR="${EVAL_AUDIO_CODES_DIR:-$REPO_ROOT/data/eval_audio_codes}"
 SAVE_DIR="${SAVE_DIR:-$REPO_ROOT/checkpoints/run_$(date +%Y%m%d_%H%M%S)}"
 
+# Smoke-test mode: substitute the canned tiny dataset, skip preprocessing
+# entirely (collator zero-fills audio codes when no audio_codes_dir is
+# usable), and shrink the training run to 20 steps. The point is to
+# prove the whole pipeline kicks -- not to train a useful model. Useful
+# as a first-job-on-a-new-cluster sanity check before generating real
+# data via ssvd/rag_augment.py.
+if [[ "${SMOKE_TEST:-0}" == "1" ]]; then
+    echo "[pipeline] SMOKE_TEST mode -- using canned data + 20 training steps"
+    DATA_JSONL="${DATA_JSONL:-$REPO_ROOT/data/smoke_test_train.jsonl}"
+    EVAL_DATA="${EVAL_DATA:-$REPO_ROOT/data/smoke_test_eval.jsonl}"
+    NUM_STEPS="${NUM_STEPS:-20}"
+    BATCH_SIZE="${BATCH_SIZE:-2}"
+    SKIP_PREPROCESS=1
+fi
+
 # Required inputs.
-: "${MIMI_WEIGHT:?set MIMI_WEIGHT to the path of your mimi safetensors file}"
-: "${DATA_JSONL:?set DATA_JSONL to the training data JSONL}"
-: "${EVAL_DATA:?set EVAL_DATA to the eval split JSONL (or pass SKIP_EVAL=1)}"
+# ``MIMI_WEIGHT`` is only used by the audio preprocessing job. Drop the
+# requirement when preprocessing is skipped (either explicitly via
+# SKIP_PREPROCESS=1 or implicitly via SMOKE_TEST=1).
+if [[ "${SKIP_PREPROCESS:-0}" != "1" ]]; then
+    : "${MIMI_WEIGHT:?set MIMI_WEIGHT to the path of your mimi safetensors file (or pass SKIP_PREPROCESS=1 / SMOKE_TEST=1)}"
+fi
+: "${DATA_JSONL:?set DATA_JSONL to the training data JSONL (or pass SMOKE_TEST=1)}"
+if [[ "${SKIP_EVAL:-0}" != "1" ]]; then
+    : "${EVAL_DATA:?set EVAL_DATA to the eval split JSONL (or pass SKIP_EVAL=1 / SMOKE_TEST=1)}"
+fi
 
 cd "$REPO_ROOT"
 mkdir -p logs "$AUDIO_CODES_DIR" "$EVAL_AUDIO_CODES_DIR" "$SAVE_DIR"
