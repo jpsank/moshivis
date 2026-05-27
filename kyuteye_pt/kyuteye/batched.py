@@ -71,6 +71,10 @@ from kyuteye.omni import (
     get_retriever,
 )
 from kyuteye.omni.arc_encoder_client import encode_reference_async, get_arc_encoder_url
+from kyuteye.omni.arc_encoder_local import (
+    encode_reference_local_async,
+    find_arc_conditioner,
+)
 from torchvision.io import ImageReadMode, decode_image
 
 if TYPE_CHECKING:
@@ -131,6 +135,7 @@ class BatchedServerState:
         omni_tool_start: str = "[TOOL:",
         omni_tool_end: str = "]",
         omni_arc_encoder_url: Optional[str] = None,
+        omni_arc_encoder_mode: Literal["auto", "local", "http"] = "auto",
         omni_injection_mode: Literal["xa", "streaming_sum", "off"] = "xa",
     ) -> None:
         assert batch_size >= 1, "batch_size must be >= 1"
@@ -157,7 +162,23 @@ class BatchedServerState:
         self.omni_tool_start = omni_tool_start
         self.omni_tool_end = omni_tool_end
         self.omni_arc_encoder_url = omni_arc_encoder_url
+        self.omni_arc_encoder_mode = omni_arc_encoder_mode
         self.omni_injection_mode = omni_injection_mode
+
+        # In-process ARC encoder conditioner discovery -- same logic as
+        # ``ServerState`` (single-session). ``find_arc_conditioner`` returns
+        # ``None`` if rag is disabled or xformers is unavailable, in which
+        # case the runtime falls back to the HTTP path automatically.
+        self.omni_local_arc_conditioner = find_arc_conditioner(moshi_vis)
+        if (
+            self.omni_arc_encoder_mode == "local"
+            and self.omni_local_arc_conditioner is None
+        ):
+            logger.warning(
+                "[Batched] omni_arc_encoder_mode='local' but no in-process "
+                "ArcEncoderConditioner found on the model. Set rag.enabled=true "
+                "in the YAML and install xformers, or set mode='http'/'auto'."
+            )
 
         # Slot pool. ``None`` = free, _SlotState = occupied.
         self.slots: list[Optional[_SlotState]] = [None] * batch_size
@@ -386,25 +407,62 @@ class BatchedServerState:
     async def _push_to_streaming_sum(
         self, slot: _SlotState, grounding_text: str, *, source_label: str
     ) -> None:
-        """Encode ``grounding_text`` via the remote ARC encoder and push
-        the resulting tensor into ``slot``'s streaming_sum queue.
+        """Encode ``grounding_text`` via the ARC encoder and push the
+        resulting tensor into ``slot``'s streaming_sum queue.
 
         Shared between retrieval (``<ret>``) and tool calls
         (``[TOOL: ...]``): both surface as short factual grounding
         strings that the LM consumes via the same conditioning pathway.
+
+        Encoder selection follows ``omni_arc_encoder_mode``: ``auto``
+        prefers the in-process conditioner if one is wired into the
+        model, otherwise falls back to HTTP; ``local`` and ``http``
+        force a specific path. See :class:`ServerState` for the
+        single-session twin.
         """
-        url = self.omni_arc_encoder_url or get_arc_encoder_url()
-        if not url:
+        tensor: Optional[torch.Tensor] = None
+        local_cond = self.omni_local_arc_conditioner
+        use_local = local_cond is not None and self.omni_arc_encoder_mode in (
+            "auto",
+            "local",
+        )
+        if use_local:
+            try:
+                tensor = await encode_reference_local_async(
+                    grounding_text, conditioner=local_cond
+                )
+            except Exception as e:
+                logger.error(
+                    "[Batched] local ARC encoder failed for %s: %s",
+                    source_label,
+                    e,
+                )
+                tensor = None
+        if tensor is None and self.omni_arc_encoder_mode != "local":
+            url = self.omni_arc_encoder_url or get_arc_encoder_url()
+            if not url:
+                logger.warning(
+                    "[Batched] streaming_sum mode but no ARC encoder available; "
+                    "skipping %s injection",
+                    source_label,
+                )
+                return
+            try:
+                tensor = await encode_reference_async(
+                    grounding_text, encoder_url=url
+                )
+            except Exception as e:
+                logger.error(
+                    "[Batched] HTTP ARC encoder failed for %s: %s",
+                    source_label,
+                    e,
+                )
+                return
+        if tensor is None:
             logger.warning(
-                "[Batched] streaming_sum mode but no ARC encoder URL; "
-                "skipping %s injection",
+                "[Batched] could not encode for %s; skipping injection",
                 source_label,
             )
-            return
-        try:
-            tensor = await encode_reference_async(grounding_text, encoder_url=url)
-        except Exception as e:
-            logger.error("[Batched] ARC encoder failed for %s: %s", source_label, e)
             return
         self.moshi_vis.update_streaming_sum_tensor(tensor, slot_idx=slot.slot_idx)
 

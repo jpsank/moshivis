@@ -34,6 +34,10 @@ from kyuteye.omni import (
     get_retriever,
 )
 from kyuteye.omni.arc_encoder_client import encode_reference_async, get_arc_encoder_url
+from kyuteye.omni.arc_encoder_local import (
+    encode_reference_local_async,
+    find_arc_conditioner,
+)
 from moshi.models.loaders import get_mimi
 from torchvision.io import ImageReadMode, decode_image
 
@@ -114,6 +118,7 @@ class ServerState:
         omni_tool_start: str = "[TOOL:",
         omni_tool_end: str = "]",
         omni_arc_encoder_url: Optional[str] = None,
+        omni_arc_encoder_mode: Literal["auto", "local", "http"] = "auto",
         omni_injection_mode: Literal["xa", "streaming_sum", "off"] = "xa",
     ):
         self.mimi = mimi
@@ -139,7 +144,24 @@ class ServerState:
         self.omni_tool_start = omni_tool_start
         self.omni_tool_end = omni_tool_end
         self.omni_arc_encoder_url = omni_arc_encoder_url
+        self.omni_arc_encoder_mode: Literal["auto", "local", "http"] = omni_arc_encoder_mode
         self.omni_injection_mode: Literal["xa", "streaming_sum", "off"] = omni_injection_mode
+
+        # Discover an in-process ARC encoder conditioner if one is wired
+        # into the loaded model. ``find_arc_conditioner`` returns ``None``
+        # when ``rag.enabled=False`` in the YAML or xformers is missing;
+        # in either case the runtime falls back to the HTTP path.
+        self.omni_local_arc_conditioner = find_arc_conditioner(moshi_vis)
+        if (
+            self.omni_arc_encoder_mode == "local"
+            and self.omni_local_arc_conditioner is None
+        ):
+            log(
+                "warning",
+                "[Omni] omni_arc_encoder_mode='local' but no in-process "
+                "ArcEncoderConditioner found on the model. Set rag.enabled=true "
+                "in the YAML and install xformers, or set mode='http'/'auto'.",
+            )
 
         self.mimi.streaming_forever(1)
         self.moshi_vis.streaming_forever(1)
@@ -209,27 +231,70 @@ class ServerState:
             await ws.send_bytes(msg)
 
         async def push_to_streaming_sum(grounding_text: str, *, source_label: str) -> None:
-            """Encode ``grounding_text`` via the remote ARC encoder and push
-            into the LM's ``streaming_sum`` queue.
+            """Encode ``grounding_text`` via the ARC encoder and push the
+            resulting tensor into the LM's ``streaming_sum`` queue.
 
             Shared between RAG (``<ret>`` -> retrieved reference) and tool
             calls (``[TOOL: ...]`` -> tool result), since both end up as
             short factual grounding strings that the LM consumes through
-            the same conditioning pathway. ``source_label`` is used only
-            in log messages.
+            the same conditioning pathway.
+
+            Encoder selection follows ``omni_arc_encoder_mode``:
+
+            * ``auto`` (default): prefer the in-process conditioner if one
+              is wired into the model; otherwise fall back to HTTP.
+            * ``local``: only use the in-process conditioner; skip
+              injection (with a warning) if it isn't available.
+            * ``http``: only use the remote service; skip injection if no
+              URL is configured.
+
+            The in-process path runs the encoder forward on the same GPU
+            as the LM (no network hop, no encoder process); the HTTP path
+            POSTs to ``REFERENCE_ENCODER_URL`` / ``--omni-arc-encoder-url``.
+            Both produce identical ``[1, T, dim]`` tensors.
             """
-            url = self.omni_arc_encoder_url or get_arc_encoder_url()
-            if not url:
+            tensor: Optional[torch.Tensor] = None
+            local_cond = self.omni_local_arc_conditioner
+            use_local = local_cond is not None and self.omni_arc_encoder_mode in (
+                "auto",
+                "local",
+            )
+            if use_local:
+                try:
+                    tensor = await encode_reference_local_async(
+                        grounding_text, conditioner=local_cond
+                    )
+                except Exception as e:
+                    log(
+                        "error",
+                        f"[Omni] local ARC encoder failed for {source_label}: {e}",
+                    )
+                    tensor = None
+            if tensor is None and self.omni_arc_encoder_mode != "local":
+                url = self.omni_arc_encoder_url or get_arc_encoder_url()
+                if not url:
+                    log(
+                        "warning",
+                        f"[Omni] streaming_sum mode but no ARC encoder available; "
+                        f"skipping {source_label} injection",
+                    )
+                    return
+                try:
+                    tensor = await encode_reference_async(
+                        grounding_text, encoder_url=url
+                    )
+                except Exception as e:
+                    log(
+                        "error",
+                        f"[Omni] HTTP ARC encoder failed for {source_label}: {e}",
+                    )
+                    return
+            if tensor is None:
+                # local mode + local encode failed.
                 log(
                     "warning",
-                    f"[Omni] streaming_sum mode but no ARC encoder URL configured; "
-                    f"skipping {source_label} injection",
+                    f"[Omni] could not encode for {source_label}; skipping",
                 )
-                return
-            try:
-                tensor = await encode_reference_async(grounding_text, encoder_url=url)
-            except Exception as e:
-                log("error", f"[Omni] ARC encoder call failed for {source_label}: {e}")
                 return
             self.moshi_vis.update_streaming_sum_tensor(tensor)
 
@@ -511,6 +576,7 @@ def start_server(
     omni_tool_start: str = "[TOOL:",
     omni_tool_end: str = "]",
     omni_arc_encoder_url: Optional[str] = None,
+    omni_arc_encoder_mode: Literal["auto", "local", "http"] = "auto",
     omni_injection_mode: Literal["xa", "streaming_sum", "off"] = "xa",
     batch_size: int = 1,
 ) -> None:
@@ -544,8 +610,19 @@ def start_server(
     :param omni_tool_end: Closing marker.
     :param omni_arc_encoder_url: URL of an external MoshiRAG-compatible ARC
         encoder service (``POST /embed`` -> safetensors ``[1, T, dim]``). Used
-        only when ``omni_injection_mode='streaming_sum'``. Defaults to the
-        ``REFERENCE_ENCODER_URL`` env var.
+        only when ``omni_injection_mode='streaming_sum'`` and the encoder
+        mode allows HTTP. Defaults to the ``REFERENCE_ENCODER_URL`` env var.
+    :param omni_arc_encoder_mode: How to obtain ARC encoder embeddings when
+        ``omni_injection_mode='streaming_sum'``.
+
+        * ``auto`` (default): use the in-process conditioner if one is
+          wired into the model (``rag.enabled=true`` in the YAML +
+          xformers installed); otherwise fall back to the HTTP service.
+        * ``local``: use only the in-process conditioner. Skips injection
+          with a warning if it isn't available -- useful for single-process
+          deployments where running a separate ARC service is overhead.
+        * ``http``: use only the remote service. Useful for production
+          where the LM and encoder run on different GPUs or hosts.
     :param omni_injection_mode: How to surface retrieved text to the model.
         * ``xa``: re-encode via SentencePiece + concat with image XA KV
           (experimental, see above).
@@ -652,6 +729,7 @@ def start_server(
             omni_tool_start=omni_tool_start,
             omni_tool_end=omni_tool_end,
             omni_arc_encoder_url=omni_arc_encoder_url,
+            omni_arc_encoder_mode=omni_arc_encoder_mode,
             omni_injection_mode=omni_injection_mode,
         )
         log("info", f"batched mode enabled (batch_size={batch_size})")
@@ -678,6 +756,7 @@ def start_server(
         omni_tool_start=omni_tool_start,
         omni_tool_end=omni_tool_end,
         omni_arc_encoder_url=omni_arc_encoder_url,
+        omni_arc_encoder_mode=omni_arc_encoder_mode,
         omni_injection_mode=omni_injection_mode,
     )
     log("info", "warming up the model")

@@ -107,16 +107,40 @@ server \
   is out of distribution. Mechanically works, semantically weak. Set
   `--no-omni-xa-injection` to skip the concat and only surface the reference
   to the UI.
-* **`streaming_sum`** — the MoshiRAG-faithful path. Requires:
-  1. A model config with `rag.enabled: true` and conditioners declared (see
-     "Combined MoshiVis+RAG model" below).
-  2. A running ARC encoder service (HTTP `POST /embed` -> safetensors
-     `[1, T, dim]`). Point at it with `--omni-arc-encoder-url=...` or the
-     `REFERENCE_ENCODER_URL` env var.
-  The retrieved text is forwarded to the ARC encoder, the response tensor is
-  pushed into the LM's streaming-sum queue via
-  `MoshiVisGen.update_streaming_sum_tensor`, and one row per step is added
-  to the LM's input embeddings.
+* **`streaming_sum`** — the MoshiRAG-faithful path. The retrieved text
+  (or tool result, see "Tool calling" below) is encoded by the ARC
+  encoder into a `[1, T, dim]` tensor that is pushed into the LM's
+  streaming-sum queue via `MoshiVisGen.update_streaming_sum_tensor`;
+  one row per step is added to the LM's input embeddings.
+
+  Requires a model config with `rag.enabled: true` and conditioners
+  declared (see "Combined MoshiVis+RAG model" below). The ARC encoder
+  itself can run in either of two modes — controlled by
+  `--omni-arc-encoder-mode`:
+
+  | Mode | Behavior |
+  | --- | --- |
+  | `auto` (default) | Use the in-process conditioner if one is wired into the loaded model; otherwise fall back to HTTP. |
+  | `local` | Force the in-process path. Skips injection with a warning if the model has no ARC conditioner (e.g. `rag.enabled=false` or xformers missing). |
+  | `http` | Force the remote service. Configure with `--omni-arc-encoder-url=...` or the `REFERENCE_ENCODER_URL` env var. |
+
+  The in-process path calls `kyuteye.conditioners.arc_encoder.ArcEncoderConditioner`
+  directly on the same GPU as the LM (no network hop, no separate
+  process). The HTTP path POSTs to `{url}/embed` and decodes a
+  safetensors response — protocol-compatible with the MoshiRAG ARC
+  encoder service. A reference implementation of that service lives in
+  this repo at `scripts/serve_arc_encoder.py` (loads the same
+  conditioner the in-process path would, wraps it in an aiohttp app):
+
+  ```bash
+  python scripts/serve_arc_encoder.py \
+      --kyuteye-config configs/moshika-vis.yaml \
+      --host 0.0.0.0 --port 8089
+  ```
+
+  Both paths produce identical tensors when given the same input; the
+  choice is operational (single-process simplicity vs. ability to scale
+  encoder and LM independently).
 * **`off`** — the reference is surfaced to the UI as `[REF: ...]` but the
   model is not touched. Useful as a control.
 
