@@ -60,10 +60,17 @@ class RagTurn:
       ``<ret>`` moshi turn. Skipped from the inline text stream and fed
       to the ARC encoder via the ``ConditionAttributes``.
     * ``tool`` -- simulated tool result, emitted right after a moshi
-      turn that contains a ``[TOOL: name(args)]`` call. Treated like a
-      user turn by the collator: included in the model's context with
-      ``loss_mask=False`` so the model learns to consume tool output
-      without being trained to generate the tool result text itself.
+      turn that contains a ``[TOOL: name(args)]`` call. Routed
+      identically to ``reference``: the collator excludes it from the
+      inline text stream and concatenates its text into
+      ``reference_with_time`` so the ARC encoder encodes it into the
+      LM's ``streaming_sum`` conditioning. This mirrors the inference
+      path, where a completed ``[TOOL: ...]`` call dispatches the tool,
+      POSTs the result to the ARC encoder service, and pushes the
+      resulting tensor into ``MoshiVisGen.update_streaming_sum_tensor``
+      -- exactly like ``<ret>`` retrieval. Tool text should be
+      formatted ``<tool_name>: <result>`` so the encoder gets both
+      sides of the call.
     """
 
     role: str

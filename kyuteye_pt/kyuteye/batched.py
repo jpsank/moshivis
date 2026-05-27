@@ -383,22 +383,40 @@ class BatchedServerState:
         msg = b"\x07" + marker.to_bytes(1, "big") + payload.encode("utf-8")
         await slot.ws.send_bytes(msg)
 
+    async def _push_to_streaming_sum(
+        self, slot: _SlotState, grounding_text: str, *, source_label: str
+    ) -> None:
+        """Encode ``grounding_text`` via the remote ARC encoder and push
+        the resulting tensor into ``slot``'s streaming_sum queue.
+
+        Shared between retrieval (``<ret>``) and tool calls
+        (``[TOOL: ...]``): both surface as short factual grounding
+        strings that the LM consumes via the same conditioning pathway.
+        """
+        url = self.omni_arc_encoder_url or get_arc_encoder_url()
+        if not url:
+            logger.warning(
+                "[Batched] streaming_sum mode but no ARC encoder URL; "
+                "skipping %s injection",
+                source_label,
+            )
+            return
+        try:
+            tensor = await encode_reference_async(grounding_text, encoder_url=url)
+        except Exception as e:
+            logger.error("[Batched] ARC encoder failed for %s: %s", source_label, e)
+            return
+        self.moshi_vis.update_streaming_sum_tensor(tensor, slot_idx=slot.slot_idx)
+
     async def _on_reference_text(self, slot: _SlotState, reference: str) -> None:
         if not reference:
             await self._send_omni_text(slot, " [RET_FAILED] ", marker=10)
             return
         await self._send_omni_text(slot, f" [REF: {reference}] ", marker=10)
         if self.omni_injection_mode == "streaming_sum":
-            url = self.omni_arc_encoder_url or get_arc_encoder_url()
-            if not url:
-                logger.warning("[Batched] streaming_sum mode but no ARC encoder URL")
-                return
-            try:
-                tensor = await encode_reference_async(reference, encoder_url=url)
-            except Exception as e:
-                logger.error("[Batched] ARC encoder failed: %s", e)
-                return
-            self.moshi_vis.update_streaming_sum_tensor(tensor, slot_idx=slot.slot_idx)
+            await self._push_to_streaming_sum(
+                slot, reference, source_label="reference"
+            )
         elif self.omni_injection_mode == "xa" and slot.context_injector is not None:
             slot.context_injector.add_text(reference, role="reference")
 
@@ -408,8 +426,17 @@ class BatchedServerState:
             return
         result = await default_registry.dispatch(event.tool)
         await self._send_omni_text(slot, f" [TOOL:{event.tool.name} -> {result}] ", marker=10)
-        if slot.context_injector is not None:
-            slot.context_injector.add_text(f"{event.tool.name} -> {result}", role="tool")
+        # Inject the tool result into the LM's conditioning the same way
+        # retrieval references are injected. The tool name appears in the
+        # encoded text so the ARC encoder sees what was queried -- matches
+        # the ``TOOL: <tool_name>: <result>`` format the training data uses.
+        grounding_text = f"{event.tool.name}: {result}"
+        if self.omni_injection_mode == "streaming_sum":
+            await self._push_to_streaming_sum(
+                slot, grounding_text, source_label=f"tool[{event.tool.name}]"
+            )
+        elif self.omni_injection_mode == "xa" and slot.context_injector is not None:
+            slot.context_injector.add_text(grounding_text, role="tool")
 
     # ---------------------------------------------------------------- WS handler
     async def handle_chat(self, request: web.Request) -> web.WebSocketResponse:

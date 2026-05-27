@@ -208,6 +208,31 @@ class ServerState:
             msg = b"\x07" + marker.to_bytes(1, "big") + payload.encode("utf-8")
             await ws.send_bytes(msg)
 
+        async def push_to_streaming_sum(grounding_text: str, *, source_label: str) -> None:
+            """Encode ``grounding_text`` via the remote ARC encoder and push
+            into the LM's ``streaming_sum`` queue.
+
+            Shared between RAG (``<ret>`` -> retrieved reference) and tool
+            calls (``[TOOL: ...]`` -> tool result), since both end up as
+            short factual grounding strings that the LM consumes through
+            the same conditioning pathway. ``source_label`` is used only
+            in log messages.
+            """
+            url = self.omni_arc_encoder_url or get_arc_encoder_url()
+            if not url:
+                log(
+                    "warning",
+                    f"[Omni] streaming_sum mode but no ARC encoder URL configured; "
+                    f"skipping {source_label} injection",
+                )
+                return
+            try:
+                tensor = await encode_reference_async(grounding_text, encoder_url=url)
+            except Exception as e:
+                log("error", f"[Omni] ARC encoder call failed for {source_label}: {e}")
+                return
+            self.moshi_vis.update_streaming_sum_tensor(tensor)
+
         async def on_reference_text(reference: str) -> None:
             if not reference:
                 await send_omni_text(" [RET_FAILED] ", marker=10)
@@ -220,20 +245,7 @@ class ServerState:
                 # ``[1, T, dim]`` tensor into the LM's streaming_sum queue.
                 # Requires the model to have been built with rag.enabled=True
                 # and for the ARC encoder service to be running.
-                url = self.omni_arc_encoder_url or get_arc_encoder_url()
-                if not url:
-                    log(
-                        "warning",
-                        "[Omni] streaming_sum mode but no ARC encoder URL configured; "
-                        "skipping injection",
-                    )
-                    return
-                try:
-                    tensor = await encode_reference_async(reference, encoder_url=url)
-                except Exception as e:
-                    log("error", f"[Omni] ARC encoder call failed: {e}")
-                    return
-                self.moshi_vis.update_streaming_sum_tensor(tensor)
+                await push_to_streaming_sum(reference, source_label="reference")
             elif self.omni_injection_mode == "xa":
                 context_injector.add_text(reference, role="reference")
             # injection_mode == "off": the [REF: ...] surface in the UI is the
@@ -248,9 +260,18 @@ class ServerState:
             log("info", f"[Omni] dispatching tool {event.tool.name}({event.tool.args}, {event.tool.kwargs})")
             result = await default_registry.dispatch(event.tool)
             await send_omni_text(f" [TOOL:{event.tool.name} -> {result}] ", marker=10)
-            context_injector.add_text(
-                f"{event.tool.name} -> {result}", role="tool"
-            )
+            # Inject the tool result into the LM's conditioning the same way
+            # we do for retrieval references. The tool name appears in the
+            # encoded text so the ARC encoder sees what was queried, not
+            # just the result -- matching the format the training data uses
+            # (``TOOL: <tool_name>: <result>``).
+            grounding_text = f"{event.tool.name}: {result}"
+            if self.omni_injection_mode == "streaming_sum":
+                await push_to_streaming_sum(grounding_text, source_label=f"tool[{event.tool.name}]")
+            elif self.omni_injection_mode == "xa":
+                context_injector.add_text(grounding_text, role="tool")
+            # injection_mode == "off": the [TOOL: ...] surface in the UI is
+            # the only place the result lands.
 
         async def recv_loop() -> None:
             nonlocal close

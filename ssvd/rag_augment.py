@@ -37,8 +37,9 @@ Three modes:
    conversations where moshi emits ``[TOOL: name(arg=value)]`` calls and
    the simulated tool output is provided as a ``tool`` turn. Trains the
    model to (a) emit tool calls in the right places and (b) consume tool
-   results from a following turn. No image by default; combine outputs
-   with the visual modes for multi-modal tool use.
+   results via the same conditioner pathway as RAG references. No image
+   by default; combine outputs with the visual modes for multi-modal
+   tool use.
 
 Output is JSONL, one example per line. Each example has:
 
@@ -49,20 +50,24 @@ Output is JSONL, one example per line. Each example has:
         {"role": "moshi", "text": "I will check ...", "rag_trigger": true},
         {"role": "reference", "text": "Reference: ..."},
         {"role": "moshi", "text": "Looking up. [TOOL: get_weather(location=\\"NYC\\")]"},
-        {"role": "tool", "text": "72F, sunny"},
+        {"role": "tool", "text": "get_weather: 72F, sunny"},
         {"role": "moshi", "text": "It's 72F and sunny in NYC."},
         ...
       ]
     }
 
 The ``rag_trigger`` boolean marks the moshi turn that emitted ``<ret>``;
-the immediately-following ``reference`` turn is what the ARC encoder would
-have produced from the retrieval LLM. ``tool`` turns are treated by the
-training collator like user turns -- included in the model's context with
-``loss_mask=False`` -- so the model learns to consume tool output without
-being trained to predict the tool result text itself. The training loop
-is responsible for converting these into the actual token sequences and
-conditioner inputs.
+the immediately-following ``reference`` turn is what the ARC encoder
+would have produced from the retrieval LLM. ``tool`` turns work the
+same way: their text is encoded by the ARC encoder and pushed into the
+LM's ``streaming_sum`` conditioning queue (both at training time, where
+the collator routes ``tool`` turns into ``reference_with_time``, and at
+inference time, where the omni layer POSTs the tool result to the ARC
+encoder service after a ``[TOOL: ...]`` completes -- exactly mirroring
+the ``<ret>`` retrieval path). Tool turns format their text as
+``<tool_name>: <result>`` so the encoder sees both what was queried
+and what came back. The training loop is responsible for converting
+these into the actual token sequences and conditioner inputs.
 
 Usage (requires an OpenAI-compatible endpoint -- vLLM, llama.cpp server,
 hosted API, etc.):
@@ -181,11 +186,14 @@ Topic / scenario: {topic}
 Write a 4-to-8-turn conversation. At least one MOSHI turn must contain a tool call. Rules:
 
 * Tool arguments use kwarg syntax with quoted string values: ``[TOOL: get_weather(location="New York")]``. Only use tools listed above; only use argument names listed for that tool.
-* After every moshi turn that contains a ``[TOOL: ...]`` call, the very next turn must be a ``TOOL:`` turn with a plausible result (one short line). Do NOT add ``TOOL:`` turns that aren't preceded by a tool call.
+* After every moshi turn that contains a ``[TOOL: ...]`` call, the very next turn must be a ``TOOL:`` turn formatted exactly as ``TOOL: <tool_name>: <result>`` (the tool name appears in the result for grounding). One short factual line, no markdown, no quotes.
 * The moshi turn after a tool result must use the result naturally -- not echo it verbatim.
 * Keep the dialogue natural and concise. No commentary, no markdown, no system messages.
 
-Use exactly these labels: ``USER:``, ``MOSHI:``, ``TOOL:``. Start with ``USER:``."""
+Use exactly these labels: ``USER:``, ``MOSHI:``, ``TOOL:``. Start with ``USER:``.
+
+Example of a correctly-formatted tool turn:
+``TOOL: get_weather: 68F, partly cloudy with light wind from the east.``"""
 
 
 # ----------------------------------------------------------------------------

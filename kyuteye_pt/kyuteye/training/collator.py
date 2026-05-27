@@ -274,11 +274,13 @@ class RagDataCollator:
     ) -> tuple[list[int], list[bool]]:
         """Tokenize one turn. Returns ``(token_ids, loss_mask)``.
 
-        Only moshi turns contribute to the next-token CE loss; user,
-        tool, and any other non-moshi role get ``loss_mask=False`` for
-        every position so they're seen as context but not predicted.
-        Reference turns are filtered out upstream (they go to the
-        :class:`ConditionAttributes` instead).
+        Only moshi turns contribute to the next-token CE loss; user turns
+        get ``loss_mask=False`` for every position so they're seen as
+        context but not predicted. ``reference`` and ``tool`` turns are
+        filtered out upstream (they go to the :class:`ConditionAttributes`
+        and are encoded by the ARC encoder, mirroring the
+        ``streaming_sum`` injection path used at inference for both
+        retrieval (``<ret>``) and tool calls (``[TOOL: ...]``)).
         """
         ids = list(self.tokenizer.encode(text))  # type: ignore[no-untyped-call]
         mask = [is_moshi] * len(ids)
@@ -344,20 +346,31 @@ class RagDataCollator:
           collator is paired with a tensor-typed conditioner that
           accepts raw strings via its own prepare hook.
 
+          Both ``reference`` turns (RAG grounding) and ``tool`` turns
+          (tool-call results) are concatenated into this field, because
+          the inference path treats them identically: the omni layer
+          POSTs the text to the ARC encoder service and the resulting
+          ``[1, T, dim]`` tensor is pushed into ``MoshiVisGen``'s
+          streaming_sum queue. Keeping both routes through the same
+          conditioner at training time matches the runtime behavior.
+
         For training a CFG model: the trainer optionally calls
         ``dropout_all_conditions`` on the returned list to build the
         null branch. That's a per-step random decision, not per-example,
         so we don't do it here.
         """
-        # Concatenate all reference turns into one string (matches the
-        # MoshiRAG convention of "Reference: <ref>" appearing once per
-        # retrieval event in the conversation).
-        references = " ".join(
-            t.text for t in example.turns if t.role == "reference"
-        )
+        # Concatenate all reference turns AND tool turns into one
+        # grounding string. References use the MoshiRAG "<ref text>"
+        # convention as-is; tool results are expected to already carry
+        # their tool-name prefix (the data generator emits
+        # ``TOOL: <tool_name>: <result>``) so the encoder sees both
+        # what was queried and what came back.
+        grounding_pieces = [
+            t.text for t in example.turns if t.role in ("reference", "tool")
+        ]
         text_conditions: dict[str, Optional[str]] = {
             "first_speaker": self.first_speaker_default,
-            "reference_with_time": references or "",
+            "reference_with_time": " ".join(grounding_pieces) or "",
         }
         return ConditionAttributes(text=text_conditions, tensor={})
 
@@ -438,15 +451,18 @@ class RagDataCollator:
         B = len(batch)
 
         # 1. Tokenize and concatenate moshi/user turns into a single text
-        #    stream per example. Reference turns are excluded from the
-        #    inline stream -- they live in the ConditionAttributes.
+        #    stream per example. Reference and tool turns are excluded
+        #    from the inline stream -- they live in the
+        #    ConditionAttributes (encoded by the ARC encoder, pushed
+        #    into streaming_sum at inference, mean-pooled into
+        #    sum_condition at training).
         text_ids_per_example: list[list[int]] = []
         loss_mask_per_example: list[list[bool]] = []
         for ex in batch:
             ids: list[int] = []
             mask: list[bool] = []
             for turn in ex.turns:
-                if turn.role == "reference":
+                if turn.role in ("reference", "tool"):
                     continue
                 turn_ids, turn_mask = self._tokenize_turn(
                     turn.text, is_moshi=(turn.role == "moshi")

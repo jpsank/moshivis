@@ -211,26 +211,11 @@ class AudioPreprocessor:
         user_pcm: list[torch.Tensor] = []
 
         for turn in example.turns:
-            if turn.role == "reference":
-                # No audio for reference turns. Skip entirely (don't even
-                # add silence -- they aren't part of the speech timeline).
-                continue
-            if turn.role == "tool":
-                # Tool result is text-only: the model consumes it via
-                # the text stream (collator includes it with loss_mask=
-                # False). Both audio streams stay silent for the tool
-                # turn's notional duration so the audio timeline stays
-                # roughly aligned with the text timeline. Sizing the
-                # silence proportional to text length matches the
-                # SilenceTTS heuristic (~80 ms per word).
-                n_words = max(1, len(turn.text.split()))
-                n_samples = int(self.config.mimi_sample_rate * 0.08 * n_words)
-                silence = torch.zeros(n_samples, dtype=torch.float32)
-                gap = self._silence(self.config.silence_ms_between_turns)
-                moshi_pcm.append(silence)
-                moshi_pcm.append(gap)
-                user_pcm.append(silence)
-                user_pcm.append(gap)
+            if turn.role in ("reference", "tool"):
+                # No audio for reference / tool turns. They aren't part
+                # of the speech timeline at all -- they're encoded by
+                # the ARC encoder into the LM's streaming_sum
+                # conditioning at training and inference.
                 continue
             speaker_id = (
                 self.config.moshi_speaker_id
