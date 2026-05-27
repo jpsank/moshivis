@@ -19,8 +19,8 @@ still needs an optimizer setup, a data pipeline, and GPU time.
 ### Phase 0 -- prepare data
 
 Generate synthetic combined visual + RAG training examples with
-`ssvd/rag_augment.py`. Both modes (`augment_visual` and `generate_text`)
-emit the JSONL schema that `RagJsonlDataset` reads:
+`ssvd/rag_augment.py`. Three modes (`augment_visual`, `generate_text`,
+`generate_tools`) all emit the JSONL schema that `RagJsonlDataset` reads:
 
 ```bash
 export LLM_BASE_URL=http://localhost:8000/v1
@@ -33,11 +33,22 @@ uv run ssvd/rag_augment.py augment_visual \
 # Text-only RAG: generate from seed topics.
 uv run ssvd/rag_augment.py generate_text \
     --topics topics.txt --output text_rag.jsonl --per_topic 20
+
+# Tool calling: train the model to emit `[TOOL: name(args)]` and
+# consume the result on the following turn. See ssvd/example_tools.json
+# for the spec format and ssvd/example_tool_topics.txt for sample
+# scenarios.
+uv run ssvd/rag_augment.py generate_tools \
+    --tools ssvd/example_tools.json \
+    --topics ssvd/example_tool_topics.txt \
+    --output tools_train.jsonl --per_topic 5
 ```
 
-Mix them in a ratio that preserves vision quality (recommend roughly
-50/50 visual/text-only -- adjust based on validation perplexity per
-modality).
+Mix them by concatenating the JSONL files in whatever ratio you want
+(recommend roughly 50% visual+RAG, 30% text-only RAG, 20% tools as a
+starting point -- adjust based on validation perplexity per modality
+and your downstream use case). The collator handles all four roles
+(`user`, `moshi`, `reference`, `tool`) uniformly.
 
 ### Phase 1 -- adapters only (recommended starting point)
 

@@ -49,7 +49,22 @@ except ImportError:  # pragma: no cover - torch is a hard dep elsewhere
 
 @dataclass
 class RagTurn:
-    """One turn of a dialogue. Roles: ``user``, ``moshi``, ``reference``."""
+    """One turn of a dialogue.
+
+    Roles:
+
+    * ``user`` -- the human side. Text appears in the model's context;
+      the model is not trained to predict it (``loss_mask=False``).
+    * ``moshi`` -- the model's side. Trained as next-token CE target.
+    * ``reference`` -- factual reference for the immediately-preceding
+      ``<ret>`` moshi turn. Skipped from the inline text stream and fed
+      to the ARC encoder via the ``ConditionAttributes``.
+    * ``tool`` -- simulated tool result, emitted right after a moshi
+      turn that contains a ``[TOOL: name(args)]`` call. Treated like a
+      user turn by the collator: included in the model's context with
+      ``loss_mask=False`` so the model learns to consume tool output
+      without being trained to generate the tool result text itself.
+    """
 
     role: str
     text: str
@@ -96,6 +111,18 @@ class RagExample:
 
     def has_rag(self) -> bool:
         return any(t.rag_trigger for t in self.turns)
+
+    def has_tool(self) -> bool:
+        """True iff any moshi turn contains a ``[TOOL: ...]`` call.
+
+        A tool call is detected by substring -- no explicit flag is set
+        by the data generator since the inline marker is unambiguous.
+        Used by :meth:`RagJsonlDataset.tool_fraction` for the trainer
+        startup log.
+        """
+        return any(
+            t.role == "moshi" and "[TOOL:" in t.text for t in self.turns
+        )
 
     def has_image(self) -> bool:
         return self.image_path is not None
@@ -172,6 +199,11 @@ class RagJsonlDataset(Dataset):  # type: ignore[misc]
         if not self.examples:
             return 0.0
         return sum(1 for e in self.examples if e.has_rag()) / len(self.examples)
+
+    def tool_fraction(self) -> float:
+        if not self.examples:
+            return 0.0
+        return sum(1 for e in self.examples if e.has_tool()) / len(self.examples)
 
     def visual_fraction(self) -> float:
         if not self.examples:

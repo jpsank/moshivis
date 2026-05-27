@@ -274,8 +274,11 @@ class RagDataCollator:
     ) -> tuple[list[int], list[bool]]:
         """Tokenize one turn. Returns ``(token_ids, loss_mask)``.
 
-        Only moshi turns contribute to the next-token CE loss; user and
-        reference turns get ``loss_mask=False`` for every position.
+        Only moshi turns contribute to the next-token CE loss; user,
+        tool, and any other non-moshi role get ``loss_mask=False`` for
+        every position so they're seen as context but not predicted.
+        Reference turns are filtered out upstream (they go to the
+        :class:`ConditionAttributes` instead).
         """
         ids = list(self.tokenizer.encode(text))  # type: ignore[no-untyped-call]
         mask = [is_moshi] * len(ids)
