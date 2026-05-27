@@ -36,6 +36,15 @@ if [[ -z "$MIMI_WEIGHT" ]]; then
     exit 1
 fi
 
+# Offline HF mode -- compute nodes typically have no internet. The
+# audio preprocessor loads only Mimi (no ARC encoder), but Mimi may
+# still try to fetch a config/tokenizer on first load if the cache
+# isn't pre-populated. Run ``scripts/hpc_setup.sh`` from a login node
+# once to fill HF_HOME, then this is offline-safe.
+export HF_HOME="${HF_HOME:-$REPO_ROOT/.cache/huggingface}"
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
+
 source "$REPO_ROOT/kyuteye_pt/.venv/bin/activate" 2>/dev/null || \
     echo "WARN: .venv not found; relying on ambient Python"
 
