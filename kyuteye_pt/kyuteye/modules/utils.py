@@ -361,14 +361,20 @@ def apply_rope(
     q: torch.Tensor,
     k: torch.Tensor,
     max_period: float = 10_000,
-    offset: int = 0,
+    offset: "int | torch.Tensor" = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Apply RoPE embedding to he input queries/keys
+    Apply RoPE embedding to the input queries/keys.
 
     :param q: queries, shape `[B, T, H, D]`.
     :param k: keys, shape `[B, T, H, D]`.
     :param max_period: maximum period for the cos and sin (aka. `theta_rope`).
+    :param offset: Either a scalar (Python ``int`` or ``[1]`` tensor, applied
+        to every batch slot) or a per-slot ``[B]`` long tensor (each slot
+        gets its own rotation base, matching upstream moshi 0.2.13 / MoshiRAG
+        multi-batch semantics). When per-slot, ``ts`` has shape ``[B, T, 1, 1]``
+        and broadcasts against the frequency table; otherwise ``ts`` is
+        ``[T, 1, 1]`` and broadcasts across batch as before.
     """
 
     batch, seq_length, num_heads, dim = q.shape
@@ -376,10 +382,26 @@ def apply_rope(
 
     ds = torch.arange(dim // 2, device=q.device, dtype=torch.float32)
     max_period_t = torch.full([1], max_period, device=q.device, dtype=torch.float32)
-    freqs = 1.0 / (max_period_t ** (2 * ds / dim))
-    ts = torch.arange(
-        offset, seq_length + offset, device=q.device, dtype=torch.float32
-    ).view(-1, 1, 1)
+    freqs = 1.0 / (max_period_t ** (2 * ds / dim))  # [dim/2]
+
+    is_per_slot = isinstance(offset, torch.Tensor) and offset.numel() == batch and batch > 1
+    if is_per_slot:
+        offset_t = offset.to(device=q.device, dtype=torch.float32).view(batch, 1)  # type: ignore[union-attr]
+        arange_t = torch.arange(seq_length, device=q.device, dtype=torch.float32).view(1, -1)
+        ts = (offset_t + arange_t).view(batch, seq_length, 1, 1)  # [B, T, 1, 1]
+    else:
+        # Scalar / single-batch path. ``offset`` may be a 0-d tensor; ``.item()``
+        # extracts the value cheaply.
+        if isinstance(offset, torch.Tensor):
+            scalar_offset = int(offset.flatten()[0].item())
+        else:
+            scalar_offset = int(offset)
+        ts = torch.arange(
+            scalar_offset,
+            seq_length + scalar_offset,
+            device=q.device,
+            dtype=torch.float32,
+        ).view(-1, 1, 1)  # [T, 1, 1]
 
     q = q.view(batch, seq_length, num_heads, dim // 2, 2)
     k = k.view(batch, seq_length, num_heads, dim // 2, 2)
@@ -419,7 +441,15 @@ class RotaryEmbedding(torch.nn.Module):
         self.max_period = max_period
 
     def forward(
-        self, q: torch.Tensor, k: torch.Tensor, offset: int = 0
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        offset: "int | torch.Tensor" = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Apply rope rotation to query or key tensor with an `offset` on temporal positions."""
+        """Apply rope rotation to query or key tensor with an `offset` on temporal positions.
+
+        ``offset`` may be a scalar (single-stream / shared offset) or a per-slot
+        ``[batch_size]`` long tensor (multi-batch with exec_mask, where each
+        slot is at a different position). See :func:`apply_rope`.
+        """
         return apply_rope(q, k, max_period=self.max_period, offset=offset)

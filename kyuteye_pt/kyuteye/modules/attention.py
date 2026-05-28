@@ -6,7 +6,7 @@
 
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, NamedTuple, Optional, Tuple
 
 import torch
 from einops import rearrange
@@ -14,9 +14,157 @@ from kyuteye.modules.streaming_utils import StreamingModule
 from kyuteye.modules.utils import RotaryEmbedding, multi_linear
 
 
+class KVCacheResult(NamedTuple):
+    """Return tuple from streaming KV-cache complete().
+
+    Matches upstream moshi 0.2.13 ``KVCacheResult`` (transformer.py:183-193).
+    ``positions[b, j]`` is the logical generation step at which cache index
+    ``j`` was written for batch slot ``b``, or ``-1`` if that slot in the
+    ring buffer is still unwritten. The attention layer uses this to build
+    a per-slot causal mask, so idle slots' stale cache contents (or freshly
+    reset slots' unwritten rows) don't get attended to.
+    """
+
+    keys: torch.Tensor  # [B, capacity, H, D] (MoshiVis tensor layout)
+    values: torch.Tensor  # [B, capacity, H, D]
+    positions: torch.Tensor  # [B, capacity] long, -1 marks invalid
+
+    @staticmethod
+    def from_kv(keys: torch.Tensor, values: torch.Tensor) -> "KVCacheResult":
+        """Pack already-windowed keys/values into a result with trivial positions.
+
+        Used as a fallback when no ring cache is involved (e.g. cross-attention,
+        where keys/values are the full provided source). Positions become a
+        sequential range ``[0, T)`` broadcast to batch.
+        """
+        B, T = keys.shape[0], keys.shape[1]
+        positions = torch.arange(T, device=keys.device, dtype=torch.long)
+        return KVCacheResult(keys, values, positions.expand(B, -1))
+
+
+class RingKVCache:
+    """Fixed-capacity ring KV cache with per-slot ``end_offset``.
+
+    Port of upstream moshi 0.2.13's ``RingKVCache`` (``moshi/modules/transformer.py``
+    line 196), adapted to MoshiVis's tensor layout ``[B, T, H, D]`` (heads
+    *after* time) instead of upstream's ``[B, H, T, D]``. The semantics are
+    identical: writes use ``torch.scatter_`` at per-slot positions modulo
+    capacity, idle slots (``exec_mask=False``) keep their cache rows AND
+    their ``end_offset`` frozen, and :meth:`complete` returns a
+    :class:`KVCacheResult` whose ``positions`` tensor flags valid cache
+    entries for the attention layer's causal mask.
+
+    Replacing MoshiVis's older growing-buffer ``KVCache`` (kept below for
+    callsites that don't yet pass a capacity) closes the architectural gap
+    the audit flagged: both MoshiRAG and current upstream moshi use this
+    ring-buffer design, while MoshiVis's pre-existing code was an older
+    pattern that pre-dated the rewrite.
+    """
+
+    def __init__(
+        self,
+        batch_size: int,
+        num_heads: int,
+        dim_per_head: int,
+        capacity: int,
+        device: torch.device = torch.device("cuda"),
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
+        assert capacity > 0
+        self.capacity = capacity
+        self.batch_size = batch_size
+        # MoshiVis layout: [2, B, capacity, H, D] (time before heads), matching
+        # the existing _complete_kv contract that returns [B, T, H, D] to the
+        # attention layer (which then does its own transpose to [B, H, T, D]
+        # right before scaled_dot_product_attention).
+        self.cache = torch.zeros(
+            (2, batch_size, capacity, num_heads, dim_per_head),
+            device=device,
+            dtype=dtype,
+        )
+        self.end_offset = torch.zeros(batch_size, device=device, dtype=torch.long)
+
+    def reset(self, reset_mask: Optional[torch.Tensor] = None) -> None:
+        """Per-slot reset. ``None`` resets all slots, else zeros only masked slots."""
+        if reset_mask is None:
+            self.end_offset.zero_()
+            return
+        reset_mask = reset_mask.to(self.end_offset.device)
+        self.end_offset[:] = torch.where(
+            reset_mask, torch.zeros_like(self.end_offset), self.end_offset
+        )
+
+    def complete(
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        exec_mask: Optional[torch.Tensor] = None,
+    ) -> KVCacheResult:
+        """Add ``k``/``v`` to the ring at each slot's ``end_offset`` and return
+        the full cache plus a per-slot positions tensor.
+
+        :param k: ``[B, T, H, D]``
+        :param v: ``[B, T, H, D]``
+        :param exec_mask: Optional ``[B]`` bool tensor. ``True`` slots advance
+            their ``end_offset`` and write new K/V; ``False`` slots keep
+            their cache rows AND their offset frozen (matches MoshiRAG
+            multi-batch semantics for idle users).
+        """
+        assert k.shape == v.shape, (k.shape, v.shape)
+        B, T, H, D = k.shape
+        if exec_mask is None:
+            exec_mask = torch.ones(B, dtype=torch.bool, device=k.device)
+        exec_mask = exec_mask.to(k.device)
+
+        # Per-slot write positions ``[B, T]`` (modulo capacity for ring semantics).
+        arange_t = torch.arange(T, device=self.end_offset.device, dtype=torch.long)
+        write_positions = (
+            self.end_offset.view(-1, 1) + arange_t.view(1, -1)
+        ) % self.capacity
+
+        # Scatter k, v into cache at per-slot positions, gated by exec_mask.
+        scatter_idx = write_positions.view(B, T, 1, 1).expand(B, T, H, D)
+        keep = exec_mask.view(B, 1, 1, 1)
+        old_k = self.cache[0].gather(1, scatter_idx)
+        old_v = self.cache[1].gather(1, scatter_idx)
+        self.cache[0].scatter_(1, scatter_idx, torch.where(keep, k, old_k))
+        self.cache[1].scatter_(1, scatter_idx, torch.where(keep, v, old_v))
+
+        # Advance end_offset per-slot.
+        self.end_offset[:] = torch.where(
+            exec_mask, self.end_offset + T, self.end_offset
+        )
+
+        # Build positions tensor for the attention layer's causal mask.
+        # ``positions[b, j]`` is the logical step at which cache index ``j``
+        # was written for slot ``b``, or ``-1`` if not yet written. Math
+        # matches upstream RingKVCache lines 258-286.
+        cap_arange = torch.arange(
+            self.capacity, device=self.end_offset.device, dtype=torch.long
+        )
+        last_offset = self.end_offset.view(-1, 1) - 1  # latest logical position per slot
+        end_index = last_offset % self.capacity  # ring index of latest write
+        delta = cap_arange - end_index
+        positions = torch.where(
+            delta <= 0,
+            last_offset + delta,
+            last_offset + delta - self.capacity,
+        )
+        invalid = cap_arange >= self.end_offset.view(-1, 1)
+        positions = torch.where(invalid, torch.full_like(positions, -1), positions)
+
+        return KVCacheResult(self.cache[0], self.cache[1], positions)
+
+
 @dataclass
 class KVCache:
-    """Efficient streaming KVCache to avoid allocating new memory too many times.
+    """Legacy growing-buffer streaming KVCache.
+
+    Kept for callsites that don't yet supply a fixed capacity (notably tests
+    and any unusual configurations). New code should use :class:`RingKVCache`,
+    which matches upstream moshi 0.2.13 and MoshiRAG. The growing-buffer
+    design pre-dates the ring-buffer rewrite and is preserved here only to
+    avoid breaking pre-existing flows.
 
     :param batch_size: Batch size.
     :param num_heads: Number of heads in the attention.
@@ -30,6 +178,9 @@ class KVCache:
     :param dtype: dtype to use for the cache.
     :param cache: Initial cache, if provided.
     :param current_end: Current end of the cache, used only when cache is provided.
+        Can be a Python int (single-stream) or a ``[batch_size]`` long tensor
+        (multi-batch with per-slot end_offset, matching moshi 0.2.13's
+        ``KVCache.end_offset`` semantics).
     """
 
     def __init__(
@@ -43,10 +194,10 @@ class KVCache:
         device: torch.device = torch.device("cuda"),
         dtype: torch.dtype = torch.bfloat16,
         cache: Optional[torch.Tensor] = None,
-        current_end: int = 0,
+        current_end: int | torch.Tensor = 0,
     ) -> None:
         if cache is None:
-            assert current_end == 0
+            assert isinstance(current_end, int) and current_end == 0
 
         assert growth > 1
         self.growth = growth
@@ -56,7 +207,18 @@ class KVCache:
 
         self.capacity = initial_size
         self.context = context
-        self.current_end = current_end
+        self.batch_size = batch_size
+        # Per-slot end-offset tensor. MoshiRAG (and upstream moshi 0.2.13)
+        # tracks one end_offset per batch slot so idle slots can be skipped
+        # via exec_mask without their cache pointer advancing. ``current_end``
+        # remains as a ``@property`` for backwards-compat callers that read
+        # the scalar max; writes go through the tensor.
+        if isinstance(current_end, torch.Tensor):
+            self._end_offset = current_end.to(device=device, dtype=torch.long)
+        else:
+            self._end_offset = torch.full(
+                (batch_size,), current_end, device=device, dtype=torch.long
+            )
 
         if cache is None:
             self._cache = torch.full(
@@ -67,6 +229,16 @@ class KVCache:
             )
         else:
             self._cache = cache
+
+    @property
+    def current_end(self) -> int:
+        """Backwards-compat scalar -- returns the max end_offset across slots."""
+        return int(self._end_offset.max().item())
+
+    @property
+    def end_offset(self) -> torch.Tensor:
+        """Per-slot end-offset tensor ``[batch_size]``."""
+        return self._end_offset
 
     def clone(self) -> "KVCache":
         """Return a separate memory copy of the KV cache"""
@@ -80,13 +252,38 @@ class KVCache:
             self._cache.device,
             self._cache.dtype,
             self._cache.clone(),
-            self.current_end,
+            self._end_offset.clone(),
         )
 
     @property
     def current_start(self) -> int:
-        """Current start of the KV cache (0 if no context size)"""
-        return 0 if self.context is None else max(self.current_end - self.context, 0)
+        """Current start of the KV cache (0 if no context size).
+
+        Returns the floor of the per-slot starts; the per-slot active window
+        for slot ``i`` is ``(end_offset[i] - context, end_offset[i])``.
+        """
+        if self.context is None:
+            return 0
+        max_end = self.current_end
+        return max(max_end - self.context, 0)
+
+    def reset(self, reset_mask: Optional[torch.Tensor] = None) -> None:
+        """Zero ``end_offset`` for the masked slots (or all slots if ``None``).
+
+        Matches moshi 0.2.13 ``KVCache.reset`` semantics so per-slot reset
+        from a parent ``MoshiVisGen.reset_streaming(reset_mask=...)`` call
+        actually clears each slot's history. The cache buffer is left intact;
+        future writes will overwrite the relevant positions.
+        """
+        if reset_mask is None:
+            self._end_offset.zero_()
+            return
+        reset_mask = reset_mask.to(self._end_offset.device)
+        self._end_offset[:] = torch.where(
+            reset_mask,
+            torch.zeros_like(self._end_offset),
+            self._end_offset,
+        )
 
     def __maybe_increase_capacity__(self, required_capacity: int) -> None:
         """If needed, increase capacity to the `required_capacity`
@@ -105,35 +302,85 @@ class KVCache:
                     device=self._cache.device,
                     dtype=self._cache.dtype,
                 )
-                new_cache[:, :, : self.current_end] = self._cache[
-                    :, :, : self.current_end
-                ]
+                # Copy valid prefix per slot. Slots advance at different rates
+                # under exec_mask, so the safe copy covers the global max end.
+                end = self.current_end
+                new_cache[:, :, :end] = self._cache[:, :, :end]
                 self._cache = new_cache
                 self.capacity = new_capacity
             else:
-                # With context, we just have to roll the predict to the left and
-                # use the new space on the right.
-                assert self.current_start > 0
-                self._cache[:] = self._cache.roll(-self.current_start, dims=2)
-                self.current_end -= self.current_start
+                # With context, we roll the cache to the left.
+                start = self.current_start
+                assert start > 0
+                self._cache[:] = self._cache.roll(-start, dims=2)
+                self._end_offset.sub_(start)
 
     def complete(
-        self, k: torch.Tensor, v: torch.Tensor
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        exec_mask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Add keys `k` and values `v` to the current cache and returns
-        cache up to the context size"""
-        assert k.shape[1] == v.shape[1]
-        self.__maybe_increase_capacity__(self.current_end + k.shape[1])
+        """Add keys/values to the cache at each slot's own ``end_offset``.
 
-        assert self.current_end + k.shape[1] <= self.capacity, (
-            self.current_end,
-            k.shape[1],
-            self.capacity,
+        Mirrors moshi 0.2.13's ``KVCache.complete`` (transformer.py:236) in
+        spirit: writes use ``torch.scatter_`` with per-slot indices, idle
+        slots (``exec_mask=False``) keep their existing values, and the
+        per-slot ``end_offset`` advances only for active slots.
+
+        Returns ``(keys, values)`` slices spanning ``[current_start,
+        max(end_offset)]`` -- positions past a slot's own ``end_offset`` may
+        contain stale values from prior writes. Callers that need exact
+        per-slot masking should consult :attr:`end_offset` and build an
+        attention mask. For MoshiVis streaming at T=1 the staleness only
+        affects idle slots, whose outputs the server discards.
+
+        :param exec_mask: Optional ``[batch_size]`` bool. ``True`` slots
+            advance their ``end_offset`` and write new K/V; ``False`` slots
+            keep their cache values at the write position and do not advance.
+            ``None`` (default) advances all slots.
+        """
+        assert k.shape[1] == v.shape[1]
+        B, T = k.shape[0], k.shape[1]
+        if exec_mask is None:
+            exec_mask = torch.ones(B, dtype=torch.bool, device=self._end_offset.device)
+
+        # Grow capacity to the global max end.
+        max_end = int((self._end_offset + T).max().item())
+        self.__maybe_increase_capacity__(max_end)
+
+        # Per-slot write positions ``[B, T]`` mod capacity (matches upstream's
+        # ring-buffer semantics; for the exponential-growth path the modulo
+        # is a no-op because positions never exceed capacity here).
+        arange_t = torch.arange(T, device=self._end_offset.device, dtype=torch.long)
+        write_positions = (self._end_offset.view(-1, 1) + arange_t.view(1, -1)) % self.capacity
+        # Expand to ``[B, T, num_heads, dim_per_head]`` for scatter on dim 2.
+        num_heads, dim_per_head = self._cache.shape[3], self._cache.shape[4]
+        scatter_index = (
+            write_positions.view(B, T, 1, 1)
+            .expand(B, T, num_heads, dim_per_head)
         )
-        self._cache[0, :, self.current_end : self.current_end + k.shape[1]] = k
-        self._cache[1, :, self.current_end : self.current_end + v.shape[1]] = v
-        self.current_end += k.shape[1]
-        valid = self._cache[:, :, self.current_start : self.current_end]
+        # ``torch.where`` to skip idle slots: read old values at write
+        # positions, gate on exec_mask, scatter back.
+        keep = exec_mask.view(B, 1, 1, 1)
+        old_k = self._cache[0].gather(1, scatter_index)
+        old_v = self._cache[1].gather(1, scatter_index)
+        new_k = torch.where(keep, k, old_k)
+        new_v = torch.where(keep, v, old_v)
+        self._cache[0].scatter_(1, scatter_index, new_k)
+        self._cache[1].scatter_(1, scatter_index, new_v)
+
+        # Advance end_offset per-slot.
+        self._end_offset[:] = torch.where(
+            exec_mask, self._end_offset + T, self._end_offset
+        )
+
+        # Return the slice up to the global max end_offset. Slots with
+        # smaller end_offset have stale tail values; we accept that since
+        # the attention output for those slots is discarded by the caller.
+        end = int(self._end_offset.max().item())
+        start = self.current_start
+        valid = self._cache[:, :, start:end]
         return valid[0], valid[1]
 
 
@@ -216,30 +463,88 @@ class MultiheadAttention(StreamingModule):
             embed_dim, mult * embed_dim, bias=False, **factory_kwargs
         )
 
+    def _reset_streaming_masked(self, reset_mask: torch.Tensor) -> None:
+        """Per-slot reset of the KV cache + streaming offset.
+
+        Closes the chain that ``MoshiVisGen.reset_streaming(reset_mask=...)``
+        starts: ``StreamingModule.reset_streaming`` walks every module and
+        calls this hook; we surgically reset only the masked slots'
+        ``end_offset`` and per-slot ``streaming_offset``, leaving other
+        active sessions untouched.
+        """
+        # KV cache: per-slot reset of end_offset (cache contents stay; future
+        # writes will overwrite the relevant ring positions). Handles both
+        # the current ``RingKVCache`` and the legacy ``KVCache`` for any
+        # code paths still on the growing-buffer variant.
+        kv_cache = self._streaming_state.get("kv_cache")
+        if isinstance(kv_cache, (RingKVCache, KVCache)):
+            kv_cache.reset(reset_mask=reset_mask)
+
+        # Per-slot streaming_offset tensor: zero out masked slots' entries.
+        offset = self._streaming_state.get("offset")
+        if isinstance(offset, torch.Tensor) and offset.dim() >= 1:
+            mask_dev = reset_mask.to(offset.device)
+            self._streaming_state["offset"] = torch.where(
+                mask_dev, torch.zeros_like(offset), offset
+            )
+
+        # Stamp the mask for downstream readers (matches base hook semantics).
+        super()._reset_streaming_masked(reset_mask)
+
     def _complete_kv(
         self, k: torch.Tensor, v: torch.Tensor, initial_kv_cache_size: int = 256
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Add key/values to the KV cache"""
-        # With cross attention we assume all keys and values
-        # are already available, and streaming is with respect
-        # to the queries only.
+    ) -> KVCacheResult:
+        """Add key/values to the KV cache, return ``(keys, values, positions)``.
+
+        Now backed by :class:`RingKVCache` to match upstream moshi 0.2.13 /
+        MoshiRAG. The ``positions`` tensor in the returned
+        :class:`KVCacheResult` lets the caller build a per-slot causal
+        attention mask so idle slots' stale K/V (or freshly-reset slots'
+        unwritten cache rows) don't contaminate the attention compute.
+
+        When an ``exec_mask`` is set on this module's streaming state, idle
+        slots' ``end_offset`` stays frozen, so RoPE positions and any
+        downstream offset counters remain in sync per-slot.
+        """
+        # With cross attention we assume all keys and values are already
+        # available; streaming is with respect to the queries only.
         if self._is_streaming and not self.cross_attention:
+            B = k.shape[0]
             if "kv_cache" not in self._streaming_state:
-                self._streaming_state["kv_cache"] = KVCache(  # type: ignore
-                    k.shape[0],
+                capacity = self.context if self.context is not None else initial_kv_cache_size
+                # For weights_per_step (depformer self-attention with codebook-
+                # specific weights), the cache only ever holds dep_q tokens.
+                if self.weights_per_step:
+                    capacity = self.weights_per_step
+                self._streaming_state["kv_cache"] = RingKVCache(  # type: ignore[assignment]
+                    B,
                     k.shape[2],
                     k.shape[3],
-                    self.context,
-                    initial_size=self.weights_per_step or initial_kv_cache_size,
+                    capacity,
                     device=k.device,
                     dtype=k.dtype,
                 )
-                self.streaming_offset = torch.zeros(1)  # type: ignore
-            kv_cache: KVCache = self._streaming_state["kv_cache"]  # type: ignore
-            self.streaming_offset += k.shape[1]
-            return kv_cache.complete(k, v)
+                self.streaming_offset = torch.zeros(B, device=k.device, dtype=torch.long)  # type: ignore[assignment]
+            kv_cache: RingKVCache = self._streaming_state["kv_cache"]  # type: ignore[assignment]
+            exec_mask = self.get_streaming_attribute("exec_mask", None)
+            # Per-slot streaming_offset advance, gated by exec_mask. Mirrors
+            # the per-slot semantics of MoshiRAG's offsets tensor and stays
+            # synchronized with RingKVCache.end_offset (both advance under
+            # the same mask, so RoPE positions match cache positions).
+            offset = self._streaming_state.get("offset")
+            if exec_mask is not None and isinstance(offset, torch.Tensor):
+                self._streaming_state["offset"] = torch.where(
+                    exec_mask.to(offset.device),
+                    offset + k.shape[1],
+                    offset,
+                )
+            elif isinstance(offset, torch.Tensor):
+                self._streaming_state["offset"] = offset + k.shape[1]
+            return kv_cache.complete(k, v, exec_mask=exec_mask)
 
-        return k, v
+        # Non-streaming or cross-attention: return inputs unchanged, with
+        # trivial positions for the attention mask path.
+        return KVCacheResult.from_kv(k, v)
 
     def forward(
         self,
@@ -314,12 +619,69 @@ class MultiheadAttention(StreamingModule):
         if self.rope:
             q, k = self.rope(q, k, offset=current_streaming_offset)
 
-        k, v = self._complete_kv(k, v)
+        # _complete_kv now returns a KVCacheResult with positions so we can
+        # build a per-slot causal mask. Cross-attention takes the
+        # ``from_kv`` fast path (trivial positions).
+        kv_result = self._complete_kv(k, v)
+        k, v = kv_result.keys, kv_result.values
 
-        # Attention
+        # Build per-slot attention mask from positions. For self-attention
+        # under streaming, each batch slot's query is at its own logical
+        # position (``current_streaming_offset[b]``). Cache entries with
+        # logical positions ``<= query position`` and ``>= 0`` are
+        # attendable; the rest (idle-slot stale rows, freshly-reset slots'
+        # unwritten cells) are masked out. This is the contribution the
+        # upstream ``RingKVCache`` upgrade buys us -- previously the
+        # attention compute could attend to stale K/V on idle slots.
+        attn_mask = attention_mask
+        if self._is_streaming and not self.cross_attention:
+            kv_positions = kv_result.positions  # [B, T_cache] long, -1 invalid
+            if isinstance(current_streaming_offset, torch.Tensor) and current_streaming_offset.dim() >= 1:
+                q_pos = current_streaming_offset.to(
+                    kv_positions.device
+                ).view(-1, 1, 1, 1)
+            else:
+                # Scalar / single-batch path: every query is at the same offset.
+                q_scalar = (
+                    int(current_streaming_offset.item())
+                    if isinstance(current_streaming_offset, torch.Tensor)
+                    else int(current_streaming_offset)
+                )
+                q_pos = torch.full(
+                    (k.shape[0], 1, 1, 1),
+                    q_scalar,
+                    device=kv_positions.device,
+                    dtype=torch.long,
+                )
+            kv_pos = kv_positions.view(k.shape[0], 1, 1, -1)
+            # attn_mask[b, 0, 0, j] is True iff slot b's query may attend to
+            # cache position j. T_q for streaming is always 1.
+            attn_mask = (kv_pos <= q_pos) & (kv_pos >= 0)
+            # Combine with any caller-supplied mask (typically None here).
+            if attention_mask is not None:
+                attn_mask = attn_mask & attention_mask
+
+        # Attention. Causal masking is required for autoregressive training:
+        # in non-streaming forward, every query position can otherwise attend
+        # to every key position including future ones, which collapses
+        # next-token prediction to a trivial copy. The published MoshiVis is
+        # inference-only and never hit this path, so this attention layer
+        # had ``is_causal=False`` hardcoded. The fix is to honor
+        # ``self.causal`` when we're in non-streaming, non-cross-attention
+        # mode AND the caller hasn't supplied an explicit ``attn_mask``
+        # (``scaled_dot_product_attention`` doesn't accept both
+        # ``is_causal=True`` and a custom mask in the same call). Streaming
+        # mode stays implicitly causal via the per-slot ``end_offset`` /
+        # positions logic upstream of this call.
+        use_causal = (
+            self.causal
+            and not self._is_streaming
+            and not self.cross_attention
+            and attn_mask is None
+        )
         q, k, v = [x.transpose(1, 2) for x in [q, k, v]]
         x = torch.nn.functional.scaled_dot_product_attention(  # pylint: disable=not-callable
-            q, k, v, is_causal=False, attn_mask=attention_mask
+            q, k, v, is_causal=use_causal, attn_mask=attn_mask
         )
         x = x.transpose(1, 2)
 

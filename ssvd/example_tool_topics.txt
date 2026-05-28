@@ -1,0 +1,10 @@
+user is packing for a trip and wants to know the weather at their destination
+user wants to convert a quick currency rate before a meeting
+user asks a trivia question that needs a web search to answer accurately
+user wants to know what time it is in a different city to schedule a call
+user is doing homework and asks for a quick arithmetic check
+user is curious about the height of a famous landmark
+user wants the local time in Tokyo while in San Francisco
+user is planning an outdoor run and asks about today's weather
+user asks who wrote a specific novel and the model needs to look it up
+user wants to compute a tip on a restaurant bill

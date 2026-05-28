@@ -18,7 +18,11 @@ requires-python = ">=3.10"
 dependencies = [
     "einops",
     "huggingface_hub",
-    "moshi==0.1.0",
+    # 0.2.13 is the first upstream release that ships ``set_exec_mask`` /
+    # mask-aware ``reset_streaming`` on ``StreamingModule`` (and MimiModel),
+    # which the BatchedServerState in this backend relies on. Earlier 0.2.x
+    # may work but is untested.
+    "moshi>=0.2.13",
     "numpy<2",
     "sentencepiece",
     "torch==2.2.0",
@@ -26,7 +30,7 @@ dependencies = [
     "tqdm",
     "transformers==4.47.0",
     "triton",
-    "fire", 
+    "fire",
     "rich",
     "pyyaml",
     "black",
@@ -34,9 +38,26 @@ dependencies = [
     "sphn >= 0.1.4",
 ]
 
+[project.optional-dependencies]
+omni = [
+    "openai >= 1.0",  # default LLM-based retriever in kyuteye.omni
+    "httpx >= 0.27",  # ARC encoder client (streaming_sum injection mode)
+]
+arc = [
+    # In-process ARC encoder (kyuteye.conditioners.arc_encoder).
+    # xformers is tightly coupled to a specific PyTorch version: 0.0.24
+    # is the release built against torch 2.2.0 (matching the project's
+    # torch pin). Bumping this requires bumping torch + torchvision in
+    # lock-step.
+    "xformers >= 0.0.24, < 0.0.26",
+]
+
 [project.scripts]
 server = "kyuteye.server:main"
 sanity-check = "kyuteye.server:sanity_check"
+# train.py lives in scripts/ rather than as a kyuteye module since it's
+# a launcher (driven by torchrun under Slurm), not library code. Invoke
+# via ``torchrun ... scripts/train.py``; the Slurm template does this.
 
 [tool.mypy]
 python_version = "3.10"

@@ -1,0 +1,124 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this repo is
+
+MoshiVis is Kyutai's Vision-Speech Model: a 7B [Moshi](https://github.com/kyutai-labs/moshi) speech-text foundation model augmented with ~206M cross-attention adapter parameters plus a frozen 400M PaliGemma2 vision encoder.
+
+The published MoshiVis is **inference-only**: the upstream repo and the published MoshiVis weights ship only inference code. This branch goes further: it ports MoshiRAG's full conditioning architecture (`ConditionProvider`, `ConditionFuser`, the ARC encoder, dropout utilities, CFG plumbing, per-slot multi-batch) on top of MoshiVis. The result is a codebase that is **inference-capable today and training-capable with a small additional trainer module**:
+
+- The full training pipeline ships: `kyuteye_pt/kyuteye/training/` (DDP trainer, collator, eval harness, per-step streaming-sum, CFG dropout, pluggable WandB/TensorBoard logging, freeze recipes), Slurm batch templates in `slurm/`, and a one-command orchestration script `scripts/run_pipeline.sh` that submits preprocessing → training → eval as a Slurm dependency chain.
+- The synthetic data generator (`ssvd/rag_augment.py`) produces JSONL examples; `kyuteye.training.audio_preprocess` adds TTS-synthesized audio codes via a pluggable `BaseTTS` interface (`SilenceTTS` for pipeline validation, `CoquiXTTS` for real synthesis).
+- One-command HPC entry: `MIMI_WEIGHT=... DATA_JSONL=... EVAL_DATA=... scripts/run_pipeline.sh`. Required env vars + knobs documented in the script's header.
+
+Three independent backend implementations of the same model live side by side:
+
+- `kyuteye_pt/` — Python/PyTorch (full precision; needs ~24GB VRAM)
+- `kyuteye_rs/` — Rust/Candle (used in the online demo; supports CUDA + Metal; supports q8 quantization)
+- `kyuteye_mlx/` — Python/MLX (Apple Silicon; supports q4 + q8)
+
+Plus the shared web frontend (`client/`) and synthetic visual dialogue dataset code (`ssvd/`).
+
+When working on a backend, **edit only that one** unless the user explicitly asks for cross-backend changes; the three implementations are independent and the PyTorch + MLX backends use different config schemas than the Rust one.
+
+## Running each backend
+
+The web UI on `https://localhost:8088` needs SSL certs at the repo root:
+
+```bash
+openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout key.pem -out cert.pem
+```
+
+Use `--ssl False` (pt) or omit `--ssl` (mlx, http by default) to skip.
+
+```bash
+# PyTorch
+cd kyuteye_pt && uv run server configs/moshika-vis.yaml --port 8088
+
+# Rust (use --features metal on macOS)
+cd kyuteye_rs && cargo run --features cuda --bin moshi-backend -r -- \
+    --config configs/config-moshika-vis.json standalone --vis
+
+# MLX (Apple Silicon)
+cd kyuteye_mlx && uv run server          # bf16
+cd kyuteye_mlx && uv run server -q 8     # q8 quantized
+```
+
+The web client is fetched prebuilt from HuggingFace on first run by `scripts/get_static_client.py`, or built locally with `cd client && npm install && npm run build` (produces `client/dist`).
+
+## CI / lint / test
+
+CI runs per-backend, all from each backend's own directory:
+
+```bash
+# kyuteye_pt
+cd kyuteye_pt && uv run --locked pylint --rcfile=.pylintrc --fail-under=8.5 ./kyuteye
+cd kyuteye_pt && uv run --locked sanity-check   # runs server.sanity_check (currently a no-op)
+
+# kyuteye_mlx
+cd kyuteye_mlx && uv run ruff format --diff && uv run ruff check --select I
+cd kyuteye_mlx && uv run --locked sanity-check
+
+# kyuteye_rs
+cd kyuteye_rs && cargo fmt --all -- --check
+cd kyuteye_rs && cargo --locked clippy --workspace --tests --examples --locked -- -D warnings
+```
+
+There is no real test suite — `kyuteye_pt/tests/hello.py` and `kyuteye_mlx/tests/test_siglip.py` are placeholders. Verify changes by running the backend and exercising the web UI.
+
+## PyTorch backend architecture
+
+`kyuteye_pt/kyuteye/server.py` is the entry point (`uv run server`). One WebSocket per client; everything runs under a single asyncio event loop with an `asyncio.Lock` that serializes the model — the PyTorch backend is **single-session at a time**, unlike MoshiRAG which batches.
+
+The per-frame pipeline in `ServerState.handle_chat.opus_loop`:
+
+1. Read PCM from the opus reader, batch into `frame_size`-sized chunks
+2. `mimi.encode(chunk)` → discrete audio codes
+3. For each codebook step, `moshi_vis.step(codes, ca_src=...)` → text token + audio tokens
+4. `mimi.decode(audio_tokens)` → PCM out, queued for the opus writer
+5. Detokenize text via SentencePiece; send each piece over the WS as a `\x07` frame
+
+Vision is injected once per session at the start: `extract_image` reads the first WS message (kind=8), runs it through `ImageProjection` (PaliGemma2 vision encoder + projection layers), and calls `MoshiVisGen.precompte_ca_kv` to precompute the cross-attention K and V. Those tensors are then passed as `ca_src` on every subsequent step.
+
+**Key model classes** (`kyuteye/models/`):
+
+- `MoshiVis` (`moshivis.py`) — the model itself; subclasses `StreamingModule`. `forward_text` runs the LLM backbone (Helium) over text+audio embeddings with optional cross-attention input. `forward_depformer` runs the per-codebook depth-transformer one step at a time.
+- `MoshiVisGen` — inference wrapper. `step()` is the autoregressive inner loop that handles the delayed-codebook cache; `depformer_step()` samples the audio codebooks. Always call inside `with moshi_vis.streaming(): ...`.
+- `Helium` (`helium.py`) — the underlying 7B LLM backbone.
+- `ImageProjection` (`image_projection.py`) — wraps the frozen vision encoder + the trained projection.
+
+**Cross-attention** (`kyuteye/modules/cross_attention.py`) is **shared across all transformer layers** via a `SharedCrossAttention` metaclass (`xa_shared=true` in the YAML config). Each layer has a gating mechanism (`XAGate`, `xa_gating: sigmoid`) that lets the model modulate the visual signal.
+
+The PyTorch config schema is `kyuteye_pt/configs/moshika-vis.yaml` parsed by `KyuteyeConfig.from_yml`. The Rust backend has its own JSON config in `kyuteye_rs/configs/` — schemas are not interchangeable.
+
+### `kyuteye_pt/kyuteye/omni/` — Omni Assistant (RAG + tool calling)
+
+Added on top of MoshiVis as an opt-in pipeline; off unless `--omni-plugin=my.module` is passed to `server`. The package adds:
+
+- **Async retrieval** ported and simplified from `kyutai-labs/moshi-rag`. Default `LLMRetriever` calls an OpenAI-compatible endpoint (`LLM_BASE_URL`); users subclass `BaseRetriever` and register via `omni.set_retriever(...)`.
+- **Tool calling** via `[TOOL: name(args)]` patterns in the model's text stream. Register functions with `@omni.tool(name=...)` or `BaseTool` subclasses via `register_tool`.
+- **TextStreamMonitor** buffers detokenized text and detects RAG triggers (default substring `<ret>`) and complete `[TOOL: ...]` patterns. Incomplete tool calls stay in the buffer so half-baked patterns never fire.
+- **ContextInjector** (experimental) re-encodes retrieved text into cross-attention K/V via the LLM's text-embedding table and concatenates with the image K/V.
+
+Important caveat: MoshiVis was trained with **image patches** as the cross-attention source. Stuffing text embeddings through the same pathway is out-of-distribution — orchestration and detection all work, but the model won't reliably ground answers in the retrieved text via the XA pathway. Retrieved/tool results are always echoed back to the UI regardless, which is the reliable surface. See `kyuteye_pt/kyuteye/omni/README.md` for the full design.
+
+### `kyuteye_pt/kyuteye/conditioners/` — MoshiRAG conditioner machinery
+
+Faithful port of MoshiRAG's `ConditionProvider` / `ConditionFuser` / `LUTConditioner` / `TensorConditioner` / `learnt_padding` so a combined MoshiVis+RAG fine-tune's state-dict layout slots into MoshiVis without surgery. `MoshiVis.forward_text` accepts `sum_condition` / `streaming_sum_condition` / `sequence_emb`; `MoshiVisGen` adds `update_streaming_sum_tensor`, `apply_pending_streaming_sum_condition`, and `prime()` (applies prepend at session start, mirroring MoshiRAG's `_reset_callback`). Training-time dropout utilities (`dropout_tensor`, `dropout_condition_`, `dropout_all_conditions`) are also ported so a future training loop on top of this repo doesn't need to copy from moshi-rag.
+
+The **ARC encoder** (`kyuteye_pt/kyuteye/conditioners/arc_encoder.py`) is the trainable reference-text encoder MoshiRAG co-trains with its LM. It's a faithful port of the upstream module: 26-layer GQA transformer with a final pooling stage, plus a 2-layer projection bridge to the LM hidden dim. xformers is an optional dep (`pip install '.[arc]'`); the conditioner constructor raises a clear error if it's missing. Use `type: arc` in `rag.conditioners` for in-process encoding, or the remote service for serving (see omni README).
+
+All of this is opt-in: enable via the new `rag:` section in `kyuteye_pt/configs/moshika-vis.yaml`. With `--omni-injection-mode=streaming_sum`, retrieved text is sent to an external ARC encoder service (`POST /embed` -> safetensors `[1, T, dim]`) and the response tensor is pushed into the LM's streaming-sum queue. Without a fine-tune, the conditioner weights are random — the path runs but the model won't ground on the reference. See `kyuteye_pt/kyuteye/omni/README.md` for the YAML schema and the combined-training workflow.
+
+CFG (`cfg_coef != 1.0`) and exec_mask-aware multi-batch inference are also wired in: `MoshiVisGen` accepts `cfg_coef`, runs internally at doubled batch with pos+null condition stacks, interpolates text + per-codebook logits before sampling. `kyuteye_pt/kyuteye/batched.py:BatchedServerState` (`--batch-size > 1`) serves up to N concurrent WebSocket sessions in parallel; idle slots are exec_mask-suppressed so their KV cache and streaming-sum queue stay intact. Limitation: a new session can only join when the pool is fully empty (per-slot reset isn't implemented; needs per-slot `end_offset` in KVCache).
+
+### `ssvd/rag_augment.py` — combined RAG+vision training-data generator
+
+Standalone script (lives next to the existing SSVD pipeline) that emits JSONL training examples for a combined MoshiVis+RAG fine-tune. Two modes: `augment_visual` takes an SSVD-generated visual dialogue and uses an LLM to insert `<ret>` markers + synthesize reference documents; `generate_text` produces pure text-only RAG conversations from a seed-topics file. Sketch quality — no dedup / quality filters / human curation. Requires an OpenAI-compatible LLM endpoint (`LLM_BASE_URL`).
+
+## Conventions
+
+- Use `uv run` (not `pip` / `python`) for the Python backends — both have committed `uv.lock` files and CI uses `--locked`.
+- The repo refuses most refactoring PRs (see `CONTRIBUTING.md`); bug fixes are welcome. Don't restructure existing files unless asked.
+- Three-backend symmetry is not enforced — adding a feature to one backend does not require porting to the others.

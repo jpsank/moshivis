@@ -6,6 +6,7 @@
 """Start Pytorch backend"""
 
 import asyncio
+import importlib
 import os
 import random
 import time
@@ -25,6 +26,18 @@ from kyuteye.config.enums import ImageEncoder
 from kyuteye.config.kyuteye_config import KyuteyeConfig
 from kyuteye.models.loaders import get_moshi_vis
 from kyuteye.modules.image_transforms import get_minimal_transforms
+from kyuteye.omni import (
+    ContextInjector,
+    OmniRAGManager,
+    TextStreamMonitor,
+    default_registry,
+    get_retriever,
+)
+from kyuteye.omni.arc_encoder_client import encode_reference_async, get_arc_encoder_url
+from kyuteye.omni.arc_encoder_local import (
+    encode_reference_local_async,
+    find_arc_conditioner,
+)
 from moshi.models.loaders import get_mimi
 from torchvision.io import ImageReadMode, decode_image
 
@@ -96,6 +109,17 @@ class ServerState:
         max_msg_size: int = 0,
         image_size: int = 448,
         xa_start: int = 0,
+        omni_enabled: bool = False,
+        omni_rag_trigger: str = "<ret>",
+        omni_rag_timeout: float = 1.5,
+        omni_rag_max_tokens: int = 512,
+        omni_rag_wait_steps: int = 0,
+        omni_xa_injection: bool = True,
+        omni_tool_start: str = "[TOOL:",
+        omni_tool_end: str = "]",
+        omni_arc_encoder_url: Optional[str] = None,
+        omni_arc_encoder_mode: Literal["auto", "local", "http"] = "auto",
+        omni_injection_mode: Literal["xa", "streaming_sum", "off"] = "xa",
     ):
         self.mimi = mimi
         self.text_tokenizer = text_tokenizer
@@ -110,6 +134,34 @@ class ServerState:
         self.dtype = dtype
         self.frame_size = int(self.mimi.sample_rate / self.mimi.frame_rate)
         self.lock = asyncio.Lock()
+
+        self.omni_enabled = omni_enabled
+        self.omni_rag_trigger = omni_rag_trigger
+        self.omni_rag_timeout = omni_rag_timeout
+        self.omni_rag_max_tokens = omni_rag_max_tokens
+        self.omni_rag_wait_steps = omni_rag_wait_steps
+        self.omni_xa_injection = omni_xa_injection
+        self.omni_tool_start = omni_tool_start
+        self.omni_tool_end = omni_tool_end
+        self.omni_arc_encoder_url = omni_arc_encoder_url
+        self.omni_arc_encoder_mode: Literal["auto", "local", "http"] = omni_arc_encoder_mode
+        self.omni_injection_mode: Literal["xa", "streaming_sum", "off"] = omni_injection_mode
+
+        # Discover an in-process ARC encoder conditioner if one is wired
+        # into the loaded model. ``find_arc_conditioner`` returns ``None``
+        # when ``rag.enabled=False`` in the YAML or xformers is missing;
+        # in either case the runtime falls back to the HTTP path.
+        self.omni_local_arc_conditioner = find_arc_conditioner(moshi_vis)
+        if (
+            self.omni_arc_encoder_mode == "local"
+            and self.omni_local_arc_conditioner is None
+        ):
+            log(
+                "warning",
+                "[Omni] omni_arc_encoder_mode='local' but no in-process "
+                "ArcEncoderConditioner found on the model. Set rag.enabled=true "
+                "in the YAML and install xformers, or set mode='http'/'auto'.",
+            )
 
         self.mimi.streaming_forever(1)
         self.moshi_vis.streaming_forever(1)
@@ -138,6 +190,153 @@ class ServerState:
         ws = web.WebSocketResponse(max_msg_size=self.max_msg_size)
         await ws.prepare(request)
         close = False
+
+        # Per-channel Omni state. Each WebSocket gets its own monitor / RAG
+        # manager / context injector so transcripts and retrieval history do
+        # not bleed between simultaneous conversations.
+        monitor = TextStreamMonitor(
+            rag_trigger=self.omni_rag_trigger,
+            rag_token_id=getattr(self.moshi_vis.lm_model, "rag_token_id", None),
+            tool_start=self.omni_tool_start,
+            tool_end=self.omni_tool_end,
+        )
+        context_injector = ContextInjector(
+            moshi_vis=self.moshi_vis,
+            tokenizer=self.text_tokenizer,
+            device=self.device,
+            dtype=self.dtype,
+            enabled=(
+                self.omni_enabled
+                and self.omni_xa_injection
+                and self.omni_injection_mode == "xa"
+            ),
+        )
+        retriever = get_retriever() if self.omni_enabled else None
+        rag_manager: OmniRAGManager | None = None
+        if retriever is not None:
+            rag_manager = OmniRAGManager(
+                retriever,
+                rag_timeout=self.omni_rag_timeout,
+                max_tokens=self.omni_rag_max_tokens,
+            )
+
+        async def send_omni_text(payload: str, marker: int = 0) -> None:
+            """Send a system / retrieved-text annotation to the client.
+
+            Reuses the existing ``\\x07`` text frame so the web UI does not
+            need a new opcode -- we just colorize it differently (marker
+            byte controls the gating color in the JS client).
+            """
+            msg = b"\x07" + marker.to_bytes(1, "big") + payload.encode("utf-8")
+            await ws.send_bytes(msg)
+
+        async def push_to_streaming_sum(grounding_text: str, *, source_label: str) -> None:
+            """Encode ``grounding_text`` via the ARC encoder and push the
+            resulting tensor into the LM's ``streaming_sum`` queue.
+
+            Shared between RAG (``<ret>`` -> retrieved reference) and tool
+            calls (``[TOOL: ...]`` -> tool result), since both end up as
+            short factual grounding strings that the LM consumes through
+            the same conditioning pathway.
+
+            Encoder selection follows ``omni_arc_encoder_mode``:
+
+            * ``auto`` (default): prefer the in-process conditioner if one
+              is wired into the model; otherwise fall back to HTTP.
+            * ``local``: only use the in-process conditioner; skip
+              injection (with a warning) if it isn't available.
+            * ``http``: only use the remote service; skip injection if no
+              URL is configured.
+
+            The in-process path runs the encoder forward on the same GPU
+            as the LM (no network hop, no encoder process); the HTTP path
+            POSTs to ``REFERENCE_ENCODER_URL`` / ``--omni-arc-encoder-url``.
+            Both produce identical ``[1, T, dim]`` tensors.
+            """
+            tensor: Optional[torch.Tensor] = None
+            local_cond = self.omni_local_arc_conditioner
+            use_local = local_cond is not None and self.omni_arc_encoder_mode in (
+                "auto",
+                "local",
+            )
+            if use_local:
+                try:
+                    tensor = await encode_reference_local_async(
+                        grounding_text, conditioner=local_cond
+                    )
+                except Exception as e:
+                    log(
+                        "error",
+                        f"[Omni] local ARC encoder failed for {source_label}: {e}",
+                    )
+                    tensor = None
+            if tensor is None and self.omni_arc_encoder_mode != "local":
+                url = self.omni_arc_encoder_url or get_arc_encoder_url()
+                if not url:
+                    log(
+                        "warning",
+                        f"[Omni] streaming_sum mode but no ARC encoder available; "
+                        f"skipping {source_label} injection",
+                    )
+                    return
+                try:
+                    tensor = await encode_reference_async(
+                        grounding_text, encoder_url=url
+                    )
+                except Exception as e:
+                    log(
+                        "error",
+                        f"[Omni] HTTP ARC encoder failed for {source_label}: {e}",
+                    )
+                    return
+            if tensor is None:
+                # local mode + local encode failed.
+                log(
+                    "warning",
+                    f"[Omni] could not encode for {source_label}; skipping",
+                )
+                return
+            self.moshi_vis.update_streaming_sum_tensor(tensor)
+
+        async def on_reference_text(reference: str) -> None:
+            if not reference:
+                await send_omni_text(" [RET_FAILED] ", marker=10)
+                return
+            log("info", f"[Omni] retrieved reference: {reference[:120]!r}")
+            await send_omni_text(f" [REF: {reference}] ", marker=10)
+
+            if self.omni_injection_mode == "streaming_sum":
+                # Route through the remote ARC encoder, then push the resulting
+                # ``[1, T, dim]`` tensor into the LM's streaming_sum queue.
+                # Requires the model to have been built with rag.enabled=True
+                # and for the ARC encoder service to be running.
+                await push_to_streaming_sum(reference, source_label="reference")
+            elif self.omni_injection_mode == "xa":
+                context_injector.add_text(reference, role="reference")
+            # injection_mode == "off": the [REF: ...] surface in the UI is the
+            # only place the reference lands; the model itself sees nothing.
+
+        async def dispatch_tool(event: Any) -> None:
+            if event.tool is None:
+                await send_omni_text(
+                    f" [TOOL_ERROR: failed to parse {event.raw!r}] ", marker=10
+                )
+                return
+            log("info", f"[Omni] dispatching tool {event.tool.name}({event.tool.args}, {event.tool.kwargs})")
+            result = await default_registry.dispatch(event.tool)
+            await send_omni_text(f" [TOOL:{event.tool.name} -> {result}] ", marker=10)
+            # Inject the tool result into the LM's conditioning the same way
+            # we do for retrieval references. The tool name appears in the
+            # encoded text so the ARC encoder sees what was queried, not
+            # just the result -- matching the format the training data uses
+            # (``TOOL: <tool_name>: <result>``).
+            grounding_text = f"{event.tool.name}: {result}"
+            if self.omni_injection_mode == "streaming_sum":
+                await push_to_streaming_sum(grounding_text, source_label=f"tool[{event.tool.name}]")
+            elif self.omni_injection_mode == "xa":
+                context_injector.add_text(grounding_text, role="tool")
+            # injection_mode == "off": the [TOOL: ...] surface in the UI is
+            # the only place the result lands.
 
         async def recv_loop() -> None:
             nonlocal close
@@ -194,16 +393,32 @@ class ServerState:
                     chunk = torch.from_numpy(chunk)
                     chunk = chunk.to(device=self.device)[None, None]
                     codes = self.mimi.encode(chunk)
+                    # mimi.encode on a single PCM frame returns one time step
+                    # per call (codes shape [B, K, 1]); the loop runs once per
+                    # frame. This matches moshi-rag/inference_utils/batch_runner.py
+                    # which asserts the same invariant before iterating. The
+                    # invariant matters for the Omni streaming-sum injection:
+                    # ``MoshiVisGen.step`` consumes one queue row per call, so
+                    # the queue must be sized in frames, not codebooks.
+                    assert codes.shape[-1] == 1, (
+                        f"expected one time step per frame, got {codes.shape}"
+                    )
                     for c in range(codes.shape[-1]):
+                        if (
+                            self.moshi_vis.get_streaming_attribute("offset", 0)
+                            >= self.xa_start
+                        ):
+                            ca_src = context_injector.current_ca_src()
+                            if ca_src is None:
+                                ca_src = self.embeddings
+                        else:
+                            ca_src = None
                         tokens, gate_weight = self.moshi_vis.step(
                             codes[:, :, c : c + 1],
-                            ca_src=(
-                                self.embeddings
-                                if self.moshi_vis.get_streaming_attribute("offset", 0)
-                                >= self.xa_start
-                                else None
-                            ),
+                            ca_src=ca_src,
                         )
+                        if rag_manager is not None:
+                            rag_manager.step()
                         if tokens is None:
                             continue
                         assert (
@@ -220,6 +435,24 @@ class ServerState:
                             text_color = round(
                                 max(min((gate_weight - 0.005) / 0.016, 1.0), 0.0) * 10
                             )
+
+                            if self.omni_enabled:
+                                emit, events = monitor.consume(_text, token_id=text_token)
+                                for event in events:
+                                    log("info", f"[Omni] event: {event.kind} {event.raw!r}")
+                                    if event.kind == "rag" and rag_manager is not None:
+                                        await send_omni_text(" [RET] ", marker=10)
+                                        await rag_manager.trigger(
+                                            wait_steps=self.omni_rag_wait_steps,
+                                            handle_reference_fn=on_reference_text,
+                                            context_provider=lambda: f"moshi: {monitor.transcript}\n",
+                                        )
+                                    elif event.kind == "tool":
+                                        asyncio.create_task(dispatch_tool(event))
+                                _text = emit
+                                if not _text:
+                                    continue
+
                             msg = (
                                 b"\x07"
                                 + text_color.to_bytes(1, "big")
@@ -276,15 +509,27 @@ class ServerState:
             opus_reader = sphn.OpusStreamReader(self.mimi.sample_rate)  # type: ignore
             self.mimi.reset_streaming()
             self.moshi_vis.reset_streaming()
+            self.moshi_vis.prime()  # apply MoshiRAG-style prepend, if any
+            monitor.reset()
+            if rag_manager is not None:
+                rag_manager.reset()
 
-            await self.extract_image(ws)
+            await self.extract_image(ws, context_injector=context_injector)
             # Send the handshake.
             await ws.send_bytes(b"\x00")
-            await asyncio.gather(opus_loop(), recv_loop(), send_loop())
+            if rag_manager is not None:
+                async with rag_manager:
+                    await asyncio.gather(opus_loop(), recv_loop(), send_loop())
+            else:
+                await asyncio.gather(opus_loop(), recv_loop(), send_loop())
         log("info", "done with connection")
         return ws
 
-    async def extract_image(self, ws: web.WebSocketResponse) -> None:
+    async def extract_image(
+        self,
+        ws: web.WebSocketResponse,
+        context_injector: Optional[ContextInjector] = None,
+    ) -> None:
         """Embed imageat the beginning of the stream"""
         first_message = await ws.receive()
         first_message = first_message.data
@@ -309,6 +554,8 @@ class ServerState:
             self.image_encoder_model(image_tensor)["cross_attention_src"]
         )
         self.embeddings = (k.to(self.dtype), v.to(self.dtype))
+        if context_injector is not None:
+            context_injector.set_image_kv(self.embeddings)
 
 
 def start_server(
@@ -320,6 +567,18 @@ def start_server(
     dtype: Literal["float32", "bfloat16"] = "bfloat16",
     ssl: bool = True,
     ssl_cert_dir: Optional[str] = None,
+    omni_plugin: Optional[str] = None,
+    omni_rag_trigger: str = "<ret>",
+    omni_rag_timeout: float = 1.5,
+    omni_rag_max_tokens: int = 512,
+    omni_rag_wait_steps: int = 0,
+    omni_xa_injection: bool = True,
+    omni_tool_start: str = "[TOOL:",
+    omni_tool_end: str = "]",
+    omni_arc_encoder_url: Optional[str] = None,
+    omni_arc_encoder_mode: Literal["auto", "local", "http"] = "auto",
+    omni_injection_mode: Literal["xa", "streaming_sum", "off"] = "xa",
+    batch_size: int = 1,
 ) -> None:
     """Start server
 
@@ -333,6 +592,51 @@ def start_server(
     :param max_img_size: Max image size (in MB) that can be
     sent via aiohttp; If 0, no limit is set. Note that input images
     are resized in any case before being sent to the encoder
+    :param omni_plugin: Dotted Python module to import at startup. The module
+        should register a retriever (``omni.set_retriever(...)``) and any tools
+        (``@omni.tool`` / ``omni.register_tool(...)``). When set, the Omni
+        Assistant pipeline is enabled.
+    :param omni_rag_trigger: Substring that, when emitted by the model,
+        triggers asynchronous retrieval. Defaults to ``<ret>``.
+    :param omni_rag_timeout: Retrieval timeout in seconds.
+    :param omni_rag_max_tokens: Max tokens to request from the retrieval LLM.
+    :param omni_rag_wait_steps: Number of model steps to wait before firing
+        retrieval (lets the model speak some filler while we look things up).
+    :param omni_xa_injection: When True (and ``omni_injection_mode='xa'``),
+        retrieved/tool text is re-encoded and concatenated with the image
+        cross-attention KV. Experimental -- the MoshiVis weights weren't
+        trained to attend to text via that pathway.
+    :param omni_tool_start: Opening marker for ``[TOOL: name(args)]`` patterns.
+    :param omni_tool_end: Closing marker.
+    :param omni_arc_encoder_url: URL of an external MoshiRAG-compatible ARC
+        encoder service (``POST /embed`` -> safetensors ``[1, T, dim]``). Used
+        only when ``omni_injection_mode='streaming_sum'`` and the encoder
+        mode allows HTTP. Defaults to the ``REFERENCE_ENCODER_URL`` env var.
+    :param omni_arc_encoder_mode: How to obtain ARC encoder embeddings when
+        ``omni_injection_mode='streaming_sum'``.
+
+        * ``auto`` (default): use the in-process conditioner if one is
+          wired into the model (``rag.enabled=true`` in the YAML +
+          xformers installed); otherwise fall back to the HTTP service.
+        * ``local``: use only the in-process conditioner. Skips injection
+          with a warning if it isn't available -- useful for single-process
+          deployments where running a separate ARC service is overhead.
+        * ``http``: use only the remote service. Useful for production
+          where the LM and encoder run on different GPUs or hosts.
+    :param omni_injection_mode: How to surface retrieved text to the model.
+        * ``xa``: re-encode via SentencePiece + concat with image XA KV
+          (experimental, see above).
+        * ``streaming_sum``: route through the remote ARC encoder and push
+          into the LM's streaming_sum queue (requires ``rag.enabled=True``
+          in the model config and a running ARC encoder service; this is the
+          MoshiRAG-faithful path).
+        * ``off``: only surface to the UI, do not touch the model.
+    :param batch_size: When > 1, the server runs in batched mode using
+        :class:`kyuteye.batched.BatchedServerState`, serving up to
+        ``batch_size`` concurrent WebSocket sessions in parallel through
+        a single batched step loop. Limitation: a new session can only
+        join when the pool is fully empty (no per-slot reset yet); see
+        the ``kyuteye/batched.py`` module docstring for details.
     """
     assert kyuteye_config_path is not None
     root_dir = Path(__file__).parents[2]
@@ -355,7 +659,9 @@ def start_server(
         mimi_weight = kyuteye_config.mimi_codec
     else:
         mimi_weight = hf_hub_download(kyuteye_config.hf_repo, kyuteye_config.mimi_codec)
-    mimi = get_mimi(mimi_weight, device)
+    # moshi 0.2.x inserted a ``mimi_config`` parameter between filename and device,
+    # so we must pass device by keyword to remain compatible with 0.1.0 call sites.
+    mimi = get_mimi(mimi_weight, device=device)
     log("info", "mimi loaded")
 
     if kyuteye_config.hf_repo is None:
@@ -383,6 +689,56 @@ def start_server(
     )
     log("info", "moshi + vision loaded")
 
+    omni_enabled = False
+    if omni_plugin:
+        log("info", f"loading omni plugin {omni_plugin!r}")
+        importlib.import_module(omni_plugin)
+        omni_enabled = True
+        retriever = get_retriever()
+        if retriever is None:
+            log(
+                "warning",
+                "omni plugin loaded but no retriever registered; RAG will be skipped",
+            )
+        else:
+            try:
+                retriever.warmup()
+            except Exception as e:
+                log("warning", f"retriever warmup failed: {e}")
+        tool_names = default_registry.names()
+        log("info", f"omni tools registered: {tool_names or '(none)'}")
+
+    if batch_size > 1:
+        from kyuteye.batched import BatchedServerState
+
+        state: Any = BatchedServerState(
+            mimi=mimi,
+            text_tokenizer=text_tokenizer,
+            moshi_vis=moshi_vis,
+            image_encoder_model=image_embedder,
+            device=device,
+            batch_size=batch_size,
+            dtype=torch_dtype,
+            xa_start=kyuteye_config.xa_start,
+            omni_enabled=omni_enabled,
+            omni_rag_trigger=omni_rag_trigger,
+            omni_rag_timeout=omni_rag_timeout,
+            omni_rag_max_tokens=omni_rag_max_tokens,
+            omni_rag_wait_steps=omni_rag_wait_steps,
+            omni_xa_injection=omni_xa_injection,
+            omni_tool_start=omni_tool_start,
+            omni_tool_end=omni_tool_end,
+            omni_arc_encoder_url=omni_arc_encoder_url,
+            omni_arc_encoder_mode=omni_arc_encoder_mode,
+            omni_injection_mode=omni_injection_mode,
+        )
+        log("info", f"batched mode enabled (batch_size={batch_size})")
+        state.warmup()
+        app = web.Application()
+        app.router.add_get("/api/chat", state.handle_chat)
+        _finish_app(app, static_path, host, port, ssl, ssl_cert_dir, root_dir)
+        return
+
     state = ServerState(
         mimi=mimi,
         text_tokenizer=text_tokenizer,
@@ -391,11 +747,41 @@ def start_server(
         device=device,
         dtype=torch_dtype,
         xa_start=kyuteye_config.xa_start,
+        omni_enabled=omni_enabled,
+        omni_rag_trigger=omni_rag_trigger,
+        omni_rag_timeout=omni_rag_timeout,
+        omni_rag_max_tokens=omni_rag_max_tokens,
+        omni_rag_wait_steps=omni_rag_wait_steps,
+        omni_xa_injection=omni_xa_injection,
+        omni_tool_start=omni_tool_start,
+        omni_tool_end=omni_tool_end,
+        omni_arc_encoder_url=omni_arc_encoder_url,
+        omni_arc_encoder_mode=omni_arc_encoder_mode,
+        omni_injection_mode=omni_injection_mode,
     )
     log("info", "warming up the model")
     state.warmup()
     app = web.Application()
     app.router.add_get("/api/chat", state.handle_chat)
+    _finish_app(app, static_path, host, port, ssl, ssl_cert_dir, root_dir)
+
+
+def _finish_app(
+    app: web.Application,
+    static_path: str,
+    host: str,
+    port: int,
+    ssl: bool,
+    ssl_cert_dir: Optional[str],
+    root_dir: Path,
+) -> None:
+    """Attach static routes + SSL + start the aiohttp app.
+
+    Extracted so the single-stream and batched server entry points share
+    the same web setup. ``setup_tunnel`` was kept here as a no-op slot --
+    the original ``start_server`` had a tunnel hook that was always None
+    in practice and we preserve that by simply omitting it.
+    """
 
     async def handle_root(_):  # type: ignore
         return web.FileResponse(os.path.join(static_path, "index.html"))
@@ -417,17 +803,6 @@ def start_server(
         protocol = "https"
 
     log("info", f"Access the Web UI directly at {protocol}://{host}:{port}")
-    if setup_tunnel is not None:
-        tunnel = setup_tunnel("localhost", port, tunnel_token, None)
-        log(
-            "info",
-            f"Tunnel started, if executing on a remote GPU, you can use {tunnel}.",
-        )
-        log(
-            "info",
-            "Note that this tunnel goes through the US and you"
-            " might experience high latency in Europe.",
-        )
     with torch.no_grad():
         web.run_app(app, port=port, ssl_context=ssl_context)
 

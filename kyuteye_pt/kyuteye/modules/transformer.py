@@ -330,10 +330,18 @@ class Transformer(StreamingModule):
             )
             x = x + self.positional_scale * pos_emb
 
-        alpha = 0.0
+        # Accumulate the gate weight as a TENSOR (not a Python float) so the
+        # surrounding forward pass stays compatible with CUDA graph capture --
+        # the host-side ``.cpu().item()`` happens at the very edge of the
+        # generation step, after the graph replay, in
+        # ``MoshiVisGen.step``. Mirrors the way upstream moshi defers
+        # device->host syncs to make ``CUDAGraphed`` capture viable. The
+        # divisor matches the prior implementation exactly so reported
+        # ``gate_weight`` values are unchanged in normal configurations.
+        alpha = torch.zeros((), device=x.device, dtype=torch.float32)
         for layer_idx, layer in enumerate(self.layers):
             x, gate_weight = layer(x, *args, **kwargs)
             if gate_weight is not None and layer_idx >= len(self.layers) - 10:
-                alpha += torch.mean(gate_weight).cpu().item()
+                alpha = alpha + torch.mean(gate_weight).float()
 
         return x, alpha / min(10, len(self.layers))

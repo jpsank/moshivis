@@ -1,0 +1,28 @@
+{
+  "tools": [
+    {
+      "name": "get_weather",
+      "description": "Get the current weather conditions at a location.",
+      "args": {"location": "string"},
+      "example_output": "72F, partly cloudy, light wind from the west"
+    },
+    {
+      "name": "search_web",
+      "description": "Search the public web and return the top snippet for the query.",
+      "args": {"query": "string"},
+      "example_output": "The Eiffel Tower is 330 meters tall including its antennas."
+    },
+    {
+      "name": "get_time",
+      "description": "Get the current local time in a timezone.",
+      "args": {"timezone": "string"},
+      "example_output": "It is 14:32 in America/Los_Angeles."
+    },
+    {
+      "name": "calculator",
+      "description": "Evaluate a simple arithmetic expression.",
+      "args": {"expression": "string"},
+      "example_output": "42"
+    }
+  ]
+}
