@@ -35,9 +35,14 @@
 #     full_lm:                                   ~70 GB+  (80GB only)
 #
 # If you OOM on 40GB cards: drop batch_size to 4 and bump
-# grad_accum_steps to compensate, or set the ARC conditioner's
-# ``finetune: false`` in the YAML to keep it frozen during the adapter
-# phase.
+# grad_accum_steps to compensate. Note: setting ``finetune: false`` in
+# the YAML's rag.conditioners block does NOT keep the ARC encoder
+# frozen under the default ``adapters_only`` recipe -- the freeze
+# recipe sets requires_grad=True on condition_provider params, then
+# ``_sync_arc_finetune`` flips finetune back to True to match. To keep
+# the ARC encoder frozen, customize freeze.py (e.g. filter out
+# ArcEncoderConditioner params from the adapters_only recipe's
+# trainable set).
 #
 # Multi-node training: this template is single-node. For multi-node DDP,
 # duplicate this file and add the standard rendezvous env vars

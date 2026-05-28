@@ -69,6 +69,25 @@ def find_arc_conditioner(
             type(cond).__name__,
         )
         return None
+    # Force ``finetune=False`` for the inference path. The conditioner's
+    # ``_get_condition`` wraps its forward in
+    # ``torch.set_grad_enabled(self.finetune)``, which OVERRIDES the
+    # outer ``torch.no_grad()`` in ``encode_reference_local``. If a
+    # training checkpoint was loaded with ``finetune=True`` and we
+    # didn't reset it here, every inference call would build the
+    # autograd graph and balloon GPU memory. Setting this once at
+    # startup (single-threaded) avoids the race the alternative
+    # save/restore pattern would create across async requests.
+    if cond.finetune:
+        logger.info(
+            "[ARC local] disabling finetune=True on encoder for inference"
+        )
+        cond.finetune = False
+        cond.eval()
+        if hasattr(cond, "embedder"):
+            cond.embedder.eval()
+        if hasattr(cond, "bridge_module"):
+            cond.bridge_module.eval()
     return cond
 
 

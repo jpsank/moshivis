@@ -97,11 +97,13 @@ def _load_arc_conditioner(
     # Build a minimal provider containing only the ARC entry. The
     # ``output_dim`` matches the LM's hidden dim from the rest of the
     # config so the produced tensors are directly compatible with the
-    # client-side ``update_streaming_sum_tensor`` call.
+    # client-side ``update_streaming_sum_tensor`` call. ``cfg.moshi.dim``
+    # is the LM hidden dimension (lives on the nested ``moshi``
+    # subconfig per kyuteye_pt/kyuteye/config/subconfigs.py:89).
     arc_only = {name: conditioners[name]}
     provider = build_condition_provider(
         arc_only,
-        output_dim=cfg.dim,
+        output_dim=cfg.moshi.dim,
         device=device,
     )
     cond = provider.conditioners[name]
